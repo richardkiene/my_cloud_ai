@@ -252,15 +252,6 @@ aws ec2 create-snapshot \
 # Destroy infrastructure
 terraform destroy
 ```
-
-### Monitoring Usage
-
-- Check CloudWatch for usage metrics
-- You'll receive email alerts when:
-  - Instance starts up
-  - Daily usage exceeds 4 hours
-  - Instance shuts down due to inactivity
-
 ## Maintenance
 
 ### Updating the Instance
@@ -269,7 +260,6 @@ terraform destroy
 ```bash
 ssh ubuntu@your-domain.com
 ```
-
 2. List available models:
 ```bash
 ollama list
@@ -284,6 +274,14 @@ ollama pull mistral
 ```bash
 ollama rm mistral
 ```
+
+### Monitoring Usage
+
+- Check CloudWatch for usage metrics
+- You'll receive email alerts when:
+  - Instance starts up
+  - Daily usage exceeds 4 hours
+  - Instance shuts down due to inactivity
 
 ## Contributing
 

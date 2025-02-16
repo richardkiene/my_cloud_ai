@@ -2,49 +2,24 @@ provider "aws" {
   region = var.aws_region
 }
 
-# Variables
-variable "aws_region" {
-  description = "AWS region"
-  default     = "us-east-1"
-}
-
-variable "custom_domain" {
-  description = "Your custom domain name"
-  type        = string
-}
-
-variable "admin_email" {
-  description = "Admin email for SSL certificates"
-  type        = string
-}
-
-variable "ssh_key_name" {
-  description = "Name of SSH key pair to use"
-  type        = string
-}
-
-variable "home_network_cidr" {
-  description = "Your home network CIDR for SSH access"
-  type        = string
-}
-
-variable "webui_password" {
-  description = "Password for WebUI access"
-  type        = string
-  sensitive   = true
-}
-
-# Data sources
 data "aws_ami" "ubuntu" {
   most_recent = true
+  
   filter {
     name   = "name"
-    values = ["ubuntu/images/hvm-ssd/ubuntu-22.04-amd64-server-*"]
+    values = ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"]
   }
+  
   filter {
     name   = "virtualization-type"
     values = ["hvm"]
   }
+  
+  filter {
+    name   = "architecture"
+    values = ["x86_64"]
+  }
+  
   owners = ["099720109477"] # Canonical
 }
 
@@ -60,19 +35,21 @@ resource "aws_ebs_volume" "ollama_data" {
   }
 }
 
-# Spot Instance Request
+# Spot Instance
 resource "aws_spot_instance_request" "ollama" {
-  ami                    = data.aws_ami.ubuntu.id
-  instance_type         = "g5.xlarge"
-  spot_type             = "persistent"
-  wait_for_fulfillment  = true
-  availability_zone     = "${var.aws_region}a"
-  key_name             = var.ssh_key_name
+  count                = var.use_spot_instance ? 1 : 0
+  ami                  = data.aws_ami.ubuntu.id
+  instance_type        = "g5.xlarge"
+  spot_type            = "persistent"
+  wait_for_fulfillment = true
+  availability_zone    = "${var.aws_region}a"
+  key_name            = var.ssh_key_name
   vpc_security_group_ids = [aws_security_group.ollama.id]
-  user_data            = templatefile("${path.module}/user_data.sh", {
+  user_data           = templatefile("${path.module}/user_data.sh", {
     DOMAIN     = var.custom_domain
     EMAIL      = var.admin_email
     PASSWORD   = var.webui_password
+    SNS_TOPIC  = aws_sns_topic.alerts.arn
   })
 
   root_block_device {
@@ -85,11 +62,36 @@ resource "aws_spot_instance_request" "ollama" {
   }
 }
 
+# On-demand Instance
+resource "aws_instance" "ollama" {
+  count                = var.use_spot_instance ? 0 : 1
+  ami                  = data.aws_ami.ubuntu.id
+  instance_type        = "g5.xlarge"
+  availability_zone    = "${var.aws_region}a"
+  key_name            = var.ssh_key_name
+  vpc_security_group_ids = [aws_security_group.ollama.id]
+  user_data           = templatefile("${path.module}/user_data.sh", {
+    DOMAIN     = var.custom_domain
+    EMAIL      = var.admin_email
+    PASSWORD   = var.webui_password
+    SNS_TOPIC  = aws_sns_topic.alerts.arn
+  })
+
+  root_block_device {
+    volume_size = 20
+    encrypted   = true
+  }
+
+  tags = {
+    Name = "ollama-ondemand"
+  }
+}
+
 # Volume Attachment
 resource "aws_volume_attachment" "ollama_data_attach" {
   device_name = "/dev/sdh"
   volume_id   = aws_ebs_volume.ollama_data.id
-  instance_id = aws_spot_instance_request.ollama.spot_instance_id
+  instance_id = var.use_spot_instance ? aws_spot_instance_request.ollama[0].spot_instance_id : aws_instance.ollama[0].id
 }
 
 # Security Group
@@ -118,7 +120,7 @@ resource "aws_security_group" "ollama" {
     to_port     = 80
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
-    description = "HTTP for Let's Encrypt validation"
+    description = "HTTP for certificate validation"
   }
 
   egress {
@@ -137,8 +139,9 @@ resource "aws_eip" "ollama" {
   }
 }
 
+# Elastic IP Association
 resource "aws_eip_association" "ollama" {
-  instance_id   = aws_spot_instance_request.ollama.spot_instance_id
+  instance_id   = var.use_spot_instance ? aws_spot_instance_request.ollama[0].spot_instance_id : aws_instance.ollama[0].id
   allocation_id = aws_eip.ollama.id
 }
 
@@ -170,7 +173,7 @@ resource "aws_cloudwatch_metric_alarm" "usage_alert" {
   alarm_actions      = [aws_sns_topic.alerts.arn]
 
   dimensions = {
-    InstanceId = aws_spot_instance_request.ollama.spot_instance_id
+    InstanceId = var.use_spot_instance ? aws_spot_instance_request.ollama[0].spot_instance_id : aws_instance.ollama[0].id
   }
 }
 
@@ -183,6 +186,49 @@ resource "aws_sns_topic_subscription" "alerts_email" {
   topic_arn = aws_sns_topic.alerts.arn
   protocol  = "email"
   endpoint  = var.admin_email
+}
+
+# IAM Role for EC2 Instance
+resource "aws_iam_role" "ollama_role" {
+  name = "ollama-instance-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "ec2.amazonaws.com"
+        }
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "ollama_policy" {
+  name = "ollama-instance-policy"
+  role = aws_iam_role.ollama_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "sns:Publish"
+        ]
+        Resource = [
+          aws_sns_topic.alerts.arn
+        ]
+      }
+    ]
+  })
+}
+
+resource "aws_iam_instance_profile" "ollama_profile" {
+  name = "ollama-instance-profile"
+  role = aws_iam_role.ollama_role.name
 }
 
 # Outputs

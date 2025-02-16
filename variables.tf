@@ -40,6 +40,12 @@ variable "webui_password" {
   sensitive   = true
 }
 
+variable "use_spot_instance" {
+  description = "Whether to use spot instances (true) or on-demand instances (false)"
+  type        = bool
+  default     = true
+}
+
 # Example values file (terraform.tfvars):
 # aws_region = "us-east-1"
 # custom_domain = "ollama.yourdomain.com"
@@ -47,3 +53,4 @@ variable "webui_password" {
 # ssh_key_name = "your-key-name"
 # home_network_cidr = "1.2.3.4/32"
 # webui_password = "your-secure-password"
+# use_spot_instance = true
