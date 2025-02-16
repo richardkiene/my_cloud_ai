@@ -12,277 +12,326 @@ This Terraform configuration deploys a secure, cost-effective Ollama instance wi
 
 ## Prerequisites
 
-### 1. AWS Account Setup
+### 1️⃣ Install Required Tools
 
-1. Create an AWS account if you don't have one
-2. Create an IAM user with programmatic access and the following permissions:
-   - AmazonEC2FullAccess
-   - AmazonRoute53FullAccess
-   - AmazonSNSFullAccess
-   - CloudWatchFullAccess
-3. Save the Access Key ID and Secret Access Key
+#### On macOS
 
-### 2. Local Tools Installation
-
-#### On macOS:
 ```bash
+# Install Homebrew if not already installed
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+# Install required tools
 brew install awscli terraform
 ```
 
-#### On Ubuntu/Debian:
+#### On Ubuntu/Debian
+
 ```bash
+# Update package list
 sudo apt-get update
+
+# Install AWS CLI
 sudo apt-get install -y awscli
+
+# Install Terraform
 wget -O- https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
 echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
 sudo apt-get update
-sudo apt-get install terraform
+sudo apt-get install -y terraform
 ```
 
-### 3. AWS CLI Configuration
+#### On Windows
+
+1. Install AWS CLI:
+   - Download from [AWS CLI Install Guide](https://aws.amazon.com/cli/)
+   - Run the installer
+   - Verify installation: `aws --version`
+
+2. Install Terraform:
+   - Download from [Terraform Downloads](https://www.terraform.io/downloads)
+   - Extract to a directory
+   - Add to PATH environment variable
+   - Verify installation: `terraform --version`
+
+### 2️⃣ Verify Tool Installation
+
+Ensure all tools are properly installed:
+
+```bash
+# Check AWS CLI version
+aws --version
+
+# Check Terraform version
+terraform --version
+```
+
+Each command should return a version number. If you get "command not found" errors, check your installation and PATH settings.
+
+### 3️⃣ Setup Your AWS Account
+
+1. Create an AWS account if you don't have one
+2. Create an IAM user with programmatic access using one of these two methods:
+
+#### Option A: Using AWS Console
+
+1. Go to IAM → Users → Add User
+2. Create a new policy with the following JSON:
+
+   ```json
+   {
+       "Version": "2012-10-17",
+       "Statement": [
+           {
+               "Effect": "Allow",
+               "Action": [
+                   "ec2:*",
+                   "route53:*",
+                   "sns:*",
+                   "cloudwatch:*"
+               ],
+               "Resource": "*"
+           },
+           {
+               "Effect": "Allow",
+               "Action": [
+                   "iam:CreateRole",
+                   "iam:PutRolePolicy",
+                   "iam:CreateInstanceProfile",
+                   "iam:AddRoleToInstanceProfile",
+                   "iam:PassRole",
+                   "iam:ListRolePolicies",
+                   "iam:GetRole",
+                   "iam:GetRolePolicy",
+                   "iam:DeleteRole",
+                   "iam:DeleteRolePolicy",
+                   "iam:RemoveRoleFromInstanceProfile",
+                   "iam:DeleteInstanceProfile",
+                   "iam:GetInstanceProfile",
+                   "iam:ListInstanceProfilesForRole",
+                   "iam:ListAttachedRolePolicies",
+                   "iam:DetachRolePolicy"
+               ],
+               "Resource": [
+                   "arn:aws:iam::*:role/ollama-instance-role",
+                   "arn:aws:iam::*:instance-profile/ollama-instance-profile"
+               ]
+           }
+       ]
+   }
+   ```
+
+#### Option B: Using AWS CLI
+
+1. Save the above policy to a file named `ollama-policy.json`
+2. Create and attach the policy:
+
+   ```bash
+   # Create the policy
+   aws iam create-policy \
+       --policy-name OllamaDeploymentPolicy \
+       --policy-document file://ollama-policy.json
+
+   # Create the user
+   aws iam create-user --user-name ollama-deployer
+
+   # Attach the policy to the user
+   aws iam attach-user-policy \
+       --user-name ollama-deployer \
+       --policy-arn arn:aws:iam::YOUR_ACCOUNT_ID:policy/OllamaDeploymentPolicy
+
+   # Create access keys
+   aws iam create-access-key --user-name ollama-deployer
+   ```
+
+3. Save the Access Key ID and Secret Access Key securely
+
+#### Required IAM Permissions Explained
+
+The policy provides the minimum required permissions:
+
+- `ec2:*` - Manage EC2 instances, security groups, and EBS volumes
+- `route53:*` - Manage DNS records
+- `sns:*` - Create and manage SNS topics for notifications
+- `cloudwatch:*` - Set up monitoring and auto-shutdown
+- Various `iam:*` permissions:
+  - Create and manage the instance role for SNS access
+  - Manage instance profiles
+  - List and modify role policies
+  - These are scoped specifically to the Ollama role and instance profile
+
+### 4️⃣ Configure AWS CLI
 
 ```bash
 aws configure
 ```
-Enter your AWS credentials and preferred region when prompted.
 
-### 4. Domain Setup
+Enter the following information:
 
-1. In Namecheap:
-   - Go to your domain's DNS settings
-   - Add/update nameservers to use AWS nameservers (will be provided after creating Route53 hosted zone)
+- AWS Access Key ID
+- AWS Secret Access Key
+- Default region (e.g., us-east-1)
+- Default output format (json)
 
-2. In AWS Route53:
-   - Create a hosted zone for your domain
-   - Note the nameservers and update them in Namecheap
-   - Wait for DNS propagation (can take up to 48 hours)
+### 5️⃣ Request Spot Instance Quota Increase (Optional)
 
-## Installation
+If you plan to use spot instances (recommended for cost savings):
 
-1. Clone this repository:
+1. Go to AWS Console → Service Quotas → EC2
+2. Search for "All G and VT Spot Instance Requests"
+3. Request a quota increase to at least 1 vCPU
+4. Wait for AWS approval (typically 1-2 business days)
+
+You can use on-demand instances while waiting for the spot instance quota increase by setting `use_spot_instance = false` in your `terraform.tfvars` file.
+
+### 6️⃣ Set Up Your Domain in Route 53
+
+1. Go to [AWS Route 53](https://console.aws.amazon.com/route53/)
+2. Click **Hosted Zones** → **Create Hosted Zone**
+3. Enter your domain name (e.g., `yourdomain.com`) and select **Public Hosted Zone**
+4. Note the **NS (Name Server) Records** AWS provides
+5. Go to your domain registrar (e.g., GoDaddy, Namecheap) and update the **Name Server (NS) Records** with the values from AWS Route 53
+6. Wait for DNS propagation (can take up to 48 hours, but usually much faster)
+
+## 🔧 Setup Instructions
+
+### 1️⃣ Configure AWS Secrets Manager
+
+Store your authentication password securely in **AWS Secrets Manager** before deploying:
+
 ```bash
-git clone [repository-url]
-cd [repository-name]
+aws secretsmanager create-secret --name my-auth-password --secret-string 'SuperSecurePassword123'
 ```
 
-2. Create a `terraform.tfvars` file:
+### 2️⃣ Update `terraform.tfvars` (or pass variables via CLI)
+
+Create a `terraform.tfvars` file with:
+
 ```hcl
-aws_region = "us-east-1"
-custom_domain = "your-domain.com"
-admin_email = "your-email@example.com"
-ssh_key_name = "your-aws-ssh-key"
-home_network_cidr = "your-home-ip/32"
-webui_password = "your-secure-password"
+custom_domain      = "yourdomain.com"
+admin_email        = "you@example.com"
+key_pair_name      = "your-aws-key"
+auth_password_secret = "my-auth-password"
+allowed_ssh_ip     = "YOUR.PUBLIC.IP/32"
+use_spot_instance  = false  # Set to true after spot instance quota increase
 ```
 
-3. Initialize Terraform:
+### 3️⃣ Initialize Terraform
+
 ```bash
 terraform init
 ```
 
-4. Apply the configuration:
-```bash
-terraform apply
-```
-
-## Validation
-
-1. Check the outputs:
-```bash
-terraform output
-```
-
-2. Verify HTTPS access:
-   - Open your domain in a browser
-   - You should see a login prompt
-   - Login with username "admin" and your configured password
-
-3. Test SSH access:
-```bash
-ssh ubuntu@your-domain.com
-```
-
-4. Verify auto-shutdown:
-   - Leave the instance idle for 15 minutes
-   - It should automatically shut down
-   - Access the WebUI again to automatically restart it
-
-## Usage
-
-### Accessing the WebUI
-
-1. Visit `https://your-domain.com`
-2. Login with:
-   - Username: admin
-   - Password: (the one you set in terraform.tfvars)
-
-### Managing Models
-
-### Updating the Instance
-
-1. SSH into the instance:
-```bash
-ssh ubuntu@your-domain.com
-```
-
-2. Update system packages:
-```bash
-sudo apt update && sudo apt upgrade -y
-```
-
-3. Update Ollama:
-```bash
-curl -fsSL https://ollama.com/install.sh | sh
-```
-
-4. Update Open-WebUI:
-```bash
-sudo docker pull ghcr.io/open-webui/open-webui:main
-sudo docker rm -f open-webui
-sudo docker run -d \
-    --name open-webui \
-    --restart unless-stopped \
-    -v /data/open-webui:/root/.cache \
-    -p 3000:8080 \
-    -e OLLAMA_API_BASE_URL=http://host.docker.internal:11434/api \
-    --add-host host.docker.internal:host-gateway \
-    ghcr.io/open-webui/open-webui:main
-```
-
-### Backing Up Data
-
-Your models and conversation history are automatically persisted on the EBS volume. However, you can create additional backups:
-
-1. Create an EBS snapshot:
-```bash
-aws ec2 create-snapshot \
-    --volume-id $(aws ec2 describe-volumes --filters "Name=tag:Name,Values=ollama-data" --query 'Volumes[0].VolumeId' --output text) \
-    --description "Ollama data backup $(date +%Y-%m-%d)"
-```
-
-2. Export conversation history:
-```bash
-sudo tar -czf ollama-backup.tar.gz /data/open-webui
-```
-
-### Troubleshooting
-
-#### Instance Not Starting
-1. Check the spot instance status:
-```bash
-aws ec2 describe-spot-instance-requests --filters "Name=tag:Name,Values=ollama-spot"
-```
-
-2. Check CloudWatch logs for errors:
-```bash
-aws logs get-log-events --log-group-name /aws/ec2/ollama --log-stream-name $(date +%Y/%m/%d)
-```
-
-#### WebUI Not Accessible
-1. Check Nginx status:
-```bash
-sudo systemctl status nginx
-```
-
-2. Check Nginx logs:
-```bash
-sudo tail -f /var/log/nginx/error.log
-```
-
-3. Check Docker container status:
-```bash
-sudo docker ps
-sudo docker logs open-webui
-```
-
-#### SSL Certificate Issues
-1. Manual certificate renewal:
-```bash
-sudo certbot renew --force-renewal
-sudo systemctl restart nginx
-```
-
-2. Check certificate status:
-```bash
-sudo certbot certificates
-```
-
-### Security Best Practices
-
-1. Regularly update the WebUI password:
-   - Edit `/etc/nginx/.htpasswd`
-   - Run: `sudo htpasswd -c /etc/nginx/.htpasswd admin`
-
-2. Keep your home IP address updated:
-   - Update `home_network_cidr` in terraform.tfvars
-   - Run: `terraform apply`
-
-3. Monitor AWS CloudTrail for suspicious activity
-
-4. Regularly rotate SSH keys:
-   - Generate new key pair in AWS
-   - Update `ssh_key_name` in terraform.tfvars
-   - Run: `terraform apply`
-
-## Cost Management
-
-The configuration uses several strategies to minimize costs:
-
-1. **Spot Instances**: Reduces compute costs by up to 90%
-2. **Auto-shutdown**: Prevents unnecessary running costs
-3. **GP3 EBS**: Cost-effective storage for models
-4. **CloudWatch Monitoring**: Alerts for excessive usage
-
-To estimate costs:
-1. G5.xlarge spot instance: ~$0.15-0.30/hour (varies by region)
-2. EBS storage: ~$0.08/GB/month
-3. Data transfer: First 1GB free, then $0.09/GB
-4. Route53: $0.50/hosted zone/month
-
-## Cleanup
-
-To destroy all resources:
+### 4️⃣ Run Terraform Apply
 
 ```bash
-# Backup data if needed
-aws ec2 create-snapshot \
-    --volume-id $(aws ec2 describe-volumes --filters "Name=tag:Name,Values=ollama-data" --query 'Volumes[0].VolumeId' --output text) \
-    --description "Final backup before teardown"
-
-# Destroy infrastructure
-terraform destroy
+terraform apply -auto-approve
 ```
-## Maintenance
 
-### Updating the Instance
+This will create:
+✅ **Spot or On-demand Instance (G5 xlarge)**  
+✅ **Elastic IP & Route 53 DNS Record**  
+✅ **Security Groups and IAM Roles**  
+✅ **Ollama & Open-WebUI Installation**  
+✅ **SSL Setup & Authentication**
 
-1. SSH into the instance
+## ✅ Verification
+
+1. **Check Terraform Outputs**
+
+   ```bash
+   terraform output
+   ```
+
+   Ensure the public IP matches your Route 53 DNS entry.
+
+2. **Verify HTTPS & Open-WebUI**
+   - Open `https://yourdomain.com`
+   - Login with `admin` and your **configured password**
+
+3. **Check SSL Certificate**
+
+   ```bash
+   openssl s_client -connect yourdomain.com:443
+   ```
+
+   Ensure it's valid and auto-renewal is enabled.
+
+4. **Check AWS Logs**
+   - Open **CloudTrail** → Check API Calls
+   - Open **CloudWatch Logs** → Check Instance Auto-Stopping
+
+## 🔄 Maintenance & Updates
+
+### 🔹 To Manually Stop the Instance
+
 ```bash
-ssh ubuntu@your-domain.com
+aws ec2 stop-instances --instance-ids INSTANCE_ID
 ```
+
+### 🔹 To Update Secrets Manager Password
+
+```bash
+aws secretsmanager update-secret --secret-id my-auth-password --secret-string 'NewSuperSecurePassword!'
+```
+
+### 🔹 To Destroy the Infrastructure
+
+```bash
+terraform destroy -auto-approve
+```
+
+## 🔒 Security Notes
+
+- **Rotate secrets regularly** using AWS Secrets Manager rotation
+- **Limit SSH access** only to your IP (`allowed_ssh_ip`)
+- **Monitor logs in CloudTrail** for unauthorized access
+- **Review security group rules** periodically
+
+## 🔄 Managing Models
+
+### Adding New Models
+
+1. SSH into your instance:
+
+   ```bash
+   ssh ubuntu@yourdomain.com
+   ```
+
 2. List available models:
-```bash
-ollama list
-```
+
+   ```bash
+   ollama list
+   ```
 
 3. Pull a new model:
-```bash
-ollama pull mistral
-```
+
+   ```bash
+   ollama pull mistral
+   ```
 
 4. Remove a model:
-```bash
-ollama rm mistral
-```
 
-### Monitoring Usage
+   ```bash
+   ollama rm mistral
+   ```
 
-- Check CloudWatch for usage metrics
-- You'll receive email alerts when:
-  - Instance starts up
-  - Daily usage exceeds 4 hours
-  - Instance shuts down due to inactivity
+### Model Storage
 
-## Contributing
+Models are stored on the persistent EBS volume mounted at `/data/ollama`. This ensures:
 
-Feel free to submit issues and enhancement requests!:
+- Models survive instance restarts
+- Models persist through spot instance replacements
+- Storage can be expanded if needed
+
+## 💰 Cost Management
+
+- Use spot instances when possible (`use_spot_instance = true`)
+- Instance auto-stops after 15 minutes of inactivity
+- Models persist on EBS, so you only pay for storage
+- Monitor CloudWatch alerts for usage exceeding 4 hours/day
+
+## 🚀 Future Improvements
+
+🔹 **Enhance with Multi-Factor Authentication (MFA)**  
+🔹 **Enable AWS GuardDuty for Threat Detection**  
+🔹 **Integrate with AWS Security Hub for automated compliance**
