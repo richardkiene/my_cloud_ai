@@ -3,7 +3,7 @@
 This guide provides step-by-step instructions to deploy **Ollama** and **Open-WebUI** on **RunPod** using their API. This setup includes:
 
 - 🔥 **RunPod GPU instance deployment**
-- 🔑 **Secure authentication for WebUI**
+- 🔑 **Secure authentication for WebUI (Basic Auth)**
 - 💾 **Persistent storage for models and data**
 - 🔒 **HTTPS with Let's Encrypt SSL**
 - 📊 **Usage monitoring and auto-shutdown after inactivity**
@@ -54,6 +54,8 @@ Create a `.env` file with the following details:
 ```bash
 RUNPOD_API_KEY="your-runpod-api-key"
 DOMAIN_NAME="yourdomain.com"
+ADMIN_USERNAME="admin"
+ADMIN_PASSWORD="your-secure-password"
 ```
 
 ### 2️⃣ Deploy Instance
@@ -61,13 +63,13 @@ DOMAIN_NAME="yourdomain.com"
 Run the deployment script:
 
 ```bash
-python runpod_deploy.py
+python main.py deploy
 ```
 
 ### 3️⃣ Verify Deployment
 
-- Open **<https://yourdomain.com>** in a browser
-- Login with the provided authentication
+- Open [**https://yourdomain.com**](https://yourdomain.com) in a browser
+- Enter the **username and password** to access Open-WebUI
 
 ### 4️⃣ Managing Models
 
@@ -92,35 +94,60 @@ ollama rm Llama-3  # Remove a model
 ### 🔹 To Stop the Instance
 
 ```bash
-python runpod_shutdown.py
+python main.py stop
 ```
 
 ### 🔹 To Restart the Instance
 
 ```bash
-python runpod_restart.py
+python main.py restart
 ```
 
 ### 🔹 To Update SSL Certificate
 
 ```bash
-ssh root@yourdomain.com "sudo certbot renew --force-renewal"
+python main.py renew_ssl
 ```
 
 ### 🔹 To Destroy Everything
 
 ```bash
-python runpod_destroy.py
+python main.py destroy
 ```
 
 ---
 
 ## 🔒 Security Notes
 
+- **Basic Authentication (Nginx)** is enabled to protect access
 - Use **strong passwords** for authentication
 - **Rotate API keys** regularly
 - **Restrict SSH access** to trusted IPs only
 - **Monitor usage** to avoid unexpected costs
+
+### 🔑 How to Change Authentication Credentials
+
+To update the admin username and password:
+
+1. SSH into the instance:
+
+   ```bash
+   ssh root@yourdomain.com
+   ```
+
+2. Update the `.htpasswd` file:
+
+   ```bash
+   echo "newadmin:$(openssl passwd -apr1 newpassword)" | sudo tee /etc/nginx/.htpasswd
+   ```
+
+3. Restart Nginx:
+
+   ```bash
+   sudo systemctl restart nginx
+   ```
+
+Now, access Open-WebUI with the new credentials.
 
 ---
 
@@ -132,4 +159,4 @@ python runpod_destroy.py
 
 ---
 
-🚀 Your **Ollama & Open-WebUI** instance is now running on **RunPod** with full automation!
+🚀 Your **Ollama & Open-WebUI** instance is now running on **RunPod** with full automation and secure authentication!

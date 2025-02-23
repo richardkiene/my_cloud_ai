@@ -1,0 +1,11 @@
+runpodctl create pod \
+        --name "open-webui-pod" \
+        --imageName "ghcr.io/open-webui/open-webui:ollama" \
+        --gpuType "NVIDIA GeForce RTX 4090" \
+        --gpuCount 1 \
+        --containerDiskSize 50 \
+        --networkVolumeId "openwebui-storage" \
+        --volumePath "/root/.ollama" \
+        --volumePath "/app/backend/data" \
+        --args "--gpus=all --restart=always" \
+        --communityCloud
