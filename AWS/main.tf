@@ -19,7 +19,7 @@ data "aws_ami" "ollama" {
 
   filter {
     name   = "image-id"
-    values = ["ami-0b87adffd619069e8"]  # Packer-built AMI ID
+    values = ["ami-0c65077ec288e3c4f"] # Packer-built AMI ID
   }
 }
 
@@ -46,7 +46,7 @@ resource "aws_spot_instance_request" "ollama" {
   key_name               = var.ssh_key_name
   vpc_security_group_ids = [aws_security_group.ollama.id]
   iam_instance_profile   = aws_iam_instance_profile.ollama_profile.name
-  user_data              = templatefile("${path.module}/user_data.sh", {
+  user_data = templatefile("${path.module}/user_data.sh", {
     custom_domain = var.custom_domain
     admin_email   = var.admin_email
   })
@@ -72,7 +72,7 @@ resource "aws_instance" "ollama" {
   key_name               = var.ssh_key_name
   vpc_security_group_ids = [aws_security_group.ollama.id]
   iam_instance_profile   = aws_iam_instance_profile.ollama_profile.name
-  user_data              = templatefile("${path.module}/user_data.sh", {
+  user_data = templatefile("${path.module}/user_data.sh", {
     custom_domain = var.custom_domain
     admin_email   = var.admin_email
   })

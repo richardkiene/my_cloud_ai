@@ -76,17 +76,4 @@ build {
   provisioner "shell" {
     script = "setup.sh"
   }
-
-  provisioner "file" {
-    source      = "docker-compose.yml"
-    destination = "/home/ubuntu/docker-compose.yml"
-  }
-
-  provisioner "shell" {
-    inline = [
-      "sudo mkdir -p /data",
-      "sudo mv /home/ubuntu/docker-compose.yml /data/docker-compose.yml",
-      "sudo chown root:root /data/docker-compose.yml"
-    ]
-  }
 }

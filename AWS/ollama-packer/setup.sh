@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-# Enable logging to a file in the ubuntu user's home directory
+# Enable logging
 exec > >(tee /home/ubuntu/packer-provisioning.log) 2>&1
 echo "Starting provisioning script: $(date)"
 
@@ -21,7 +21,7 @@ curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-contai
 echo "Updating package lists after adding NVIDIA repository..."
 sudo apt-get update -y
 
-# Install basic dependencies (common for all instance types)
+# Install dependencies including NVIDIA drivers
 echo "Installing dependencies..."
 sudo apt-get install -y \
     docker.io \
@@ -30,121 +30,112 @@ sudo apt-get install -y \
     certbot \
     python3-certbot-nginx \
     apache2-utils \
-    nvme-cli
+    nvme-cli \
+    nvidia-container-toolkit \
+    nvidia-driver-535 \
+    nvidia-utils-535
 
-# Create script to detect and install NVIDIA drivers on first boot
-cat > /tmp/setup_nvidia.sh << 'NVIDIA_EOF'
+# Ensure NVIDIA modules load at boot
+echo "nvidia" | sudo tee -a /etc/modules
+
+# Create the setup script
+sudo mkdir -p /usr/local/bin
+sudo tee /usr/local/bin/ollama-setup.sh > /dev/null << 'EOF'
 #!/bin/bash
 set -e
 
-# Skip if already run
-if [ -f /var/lib/nvidia-setup-complete ]; then
-    echo "NVIDIA setup already completed."
-    exit 0
+# Log all output
+exec > >(tee /var/log/ollama-setup.log) 2>&1
+
+echo "Starting Ollama setup at $(date)"
+
+# Ensure NVIDIA driver is loaded
+if ! lsmod | grep -q nvidia; then
+  echo "Loading NVIDIA kernel module..."
+  modprobe nvidia
+  
+  # Verify NVIDIA driver is working
+  if ! nvidia-smi > /dev/null 2>&1; then
+    echo "ERROR: NVIDIA drivers failed to load!"
+    exit 1
+  fi
+  echo "NVIDIA drivers loaded successfully."
 fi
 
-# Log to a file
-exec > >(tee /var/log/nvidia-setup.log) 2>&1
-echo "Checking for NVIDIA GPU: $(date)"
+# Configure Nginx
+if [ -f "/etc/nginx/sites-available/ollama-template" ]; then
+  # Get the hostname or use a provided domain
+  DOMAIN=${1:-$(curl -s http://169.254.169.254/latest/meta-data/public-hostname)}
+  EMAIL=${2:-"admin@example.com"}
+  
+  echo "Configuring Nginx for domain: $DOMAIN"
+  
+  # Create configuration from template
+  cp /etc/nginx/sites-available/ollama-template /etc/nginx/sites-available/ollama
+  sed -i "s/DOMAIN_PLACEHOLDER/$DOMAIN/g" /etc/nginx/sites-available/ollama
+  
+  # Enable the site
+  ln -sf /etc/nginx/sites-available/ollama /etc/nginx/sites-enabled/
+  rm -f /etc/nginx/sites-enabled/default
+  
+  # Test and restart Nginx
+  nginx -t && systemctl restart nginx
+  echo "Nginx configured successfully."
+  
+  # Set up SSL certificate if domain is provided and not an EC2 hostname
+  if [[ ! "$DOMAIN" =~ "amazonaws.com" ]] && [[ ! "$DOMAIN" =~ "compute" ]]; then
+    echo "Setting up SSL certificate for $DOMAIN..."
+    certbot --nginx -d $DOMAIN --non-interactive --agree-tos -m $EMAIL
+    echo "SSL certificate installed successfully."
+    
+    # Auto renewal
+    echo "0 0 * * * root certbot renew --quiet" | tee -a /etc/crontab
+  else
+    echo "Using EC2 hostname, skipping SSL setup."
+  fi
+fi
 
-# Only install NVIDIA drivers if GPU is present
-if sudo lspci | grep -i nvidia > /dev/null; then
-    echo "NVIDIA GPU detected, installing drivers..."
-    sudo apt-get update -y
-    sudo apt-get install -y nvidia-container-toolkit nvidia-driver-535 nvidia-utils-535
+# Start the containers
+echo "Starting Docker containers..."
+cd /data && docker-compose down || true
+cd /data && docker-compose up -d
 
-    # Configure Docker to use NVIDIA runtime
-    sudo mkdir -p /etc/docker
-    sudo tee /etc/docker/daemon.json << 'EOF'
-{
-    "storage-driver": "overlay2",
-    "max-concurrent-downloads": 50,
-    "max-concurrent-uploads": 50,
-    "runtimes": {
-        "nvidia": {
-            "path": "nvidia-container-runtime",
-            "runtimeArgs": []
-        }
-    }
-}
+# Verify containers are running
+if docker ps | grep -q "ollama"; then
+  echo "Ollama container is running."
+else
+  echo "ERROR: Ollama container failed to start!"
+fi
+
+if docker ps | grep -q "open-webui"; then
+  echo "Open-WebUI container is running."
+else
+  echo "ERROR: Open-WebUI container failed to start!"
+fi
+
+echo "Ollama setup completed at $(date)"
 EOF
 
-    # Restart Docker to apply new configuration
-    sudo systemctl daemon-reload
-    sudo systemctl restart docker
+sudo chmod +x /usr/local/bin/ollama-setup.sh
 
-    # Test NVIDIA driver
-    if sudo nvidia-smi; then
-        echo "NVIDIA driver successfully installed"
-    else
-        echo "NVIDIA driver installation failed"
-        exit 1
-    fi
-else
-    echo "No NVIDIA GPU detected, skipping driver installation."
-fi
-
-# Mark as complete to avoid running twice
-sudo touch /var/lib/nvidia-setup-complete
-NVIDIA_EOF
-
-# Make script executable and move to appropriate location
-sudo chmod +x /tmp/setup_nvidia.sh
-sudo mv /tmp/setup_nvidia.sh /usr/local/bin/setup_nvidia.sh
-
-# Create systemd service to run the script on first boot
-cat > /tmp/nvidia-setup.service << 'EOF'
+# Create systemd service
+sudo tee /etc/systemd/system/ollama-setup.service > /dev/null << 'EOF'
 [Unit]
-Description=Setup NVIDIA drivers if GPU is present
-After=network.target
+Description=Ollama Setup Service
+After=docker.service network-online.target
+Wants=docker.service network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/setup_nvidia.sh
+ExecStart=/usr/local/bin/ollama-setup.sh
 RemainAfterExit=true
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-sudo mv /tmp/nvidia-setup.service /etc/systemd/system/
-sudo systemctl enable nvidia-setup.service
-
-# Configure Docker to use NVIDIA runtime
-echo "Configuring Docker with NVIDIA runtime..."
-sudo mkdir -p /etc/docker
-sudo tee /etc/docker/daemon.json > /dev/null <<EOF
-{
-    "storage-driver": "overlay2",
-    "max-concurrent-downloads": 50,
-    "max-concurrent-uploads": 50,
-    "runtimes": {
-        "nvidia": {
-            "path": "nvidia-container-runtime",
-            "runtimeArgs": []
-        }
-    }
-}
-EOF
-
-# Start and enable Docker service
-echo "Starting Docker service..."
-sudo systemctl enable docker
-sudo systemctl start docker
-
-# Restart Docker to apply new configuration
-echo "Restarting Docker service..."
-sudo systemctl daemon-reload
-sudo systemctl restart docker
-
-# Create data directories
-echo "Creating data directories..."
-sudo mkdir -p /data/ollama
-sudo mkdir -p /data/open-webui
-
-# Configure Nginx default site for later customization
-echo "Setting up Nginx default configuration..."
-sudo tee /etc/nginx/sites-available/ollama-template > /dev/null <<EOF
+# Configure Nginx template
+sudo tee /etc/nginx/sites-available/ollama-template > /dev/null << 'EOF'
 server {
     listen 80;
     server_name DOMAIN_PLACEHOLDER;
@@ -152,15 +143,62 @@ server {
     location / {
         proxy_pass http://127.0.0.1:3000;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection 'upgrade';
-        proxy_set_header Host \$host;
-        proxy_cache_bypass \$http_upgrade;
+        proxy_set_header Host $host;
+        proxy_cache_bypass $http_upgrade;
     }
 }
 EOF
 
-# Cleanup APT cache to reduce image size
+# Create docker-compose.yml with correct environment variable
+sudo mkdir -p /data
+sudo tee /data/docker-compose.yml > /dev/null << 'EOF'
+version: '3'
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    runtime: nvidia
+    ports:
+      - "11434:11434"
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    volumes:
+      - /data/ollama:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    ports:
+      - "3000:8080"
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434
+    volumes:
+      - /data/open-webui:/root/.cache
+    depends_on:
+      - ollama
+    restart: unless-stopped
+EOF
+
+# Create data directories
+sudo mkdir -p /data/ollama
+sudo mkdir -p /data/open-webui
+
+# Enable the service
+sudo systemctl daemon-reload
+sudo systemctl enable ollama-setup.service
+
+# Cleanup
 echo "Cleaning up..."
 sudo apt-get clean
 sudo apt-get autoremove -y
