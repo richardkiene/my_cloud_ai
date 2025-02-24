@@ -1,104 +1,75 @@
 #!/bin/bash
 set -e
 
-# Mount EBS volume for persistent storage
-sudo mkfs -t ext4 /dev/sdh || true
-sudo mkdir -p /data
-echo '/dev/sdh /data ext4 defaults,nofail 0 2' | sudo tee -a /etc/fstab
-sudo mount -a
+# These variables will be replaced by Terraform
+CUSTOM_DOMAIN="${custom_domain}"
+ADMIN_EMAIL="${admin_email}"
 
-# Install dependencies
-sudo apt-get update
-sudo apt-get install -y \
-    docker.io \
-    nginx \
-    certbot \
-    python3-certbot-nginx \
-    apache2-utils
+# Redirect all output to a log file for debugging
+exec > /var/log/user-data.log 2>&1
 
-# Start Docker
-sudo systemctl enable docker
-sudo systemctl start docker
-
-# Configure data directories
-sudo mkdir -p /data/ollama
-sudo mkdir -p /data/open-webui
-
-# Install Ollama
-curl -fsSL https://ollama.com/install.sh | sh
-
-# Configure Ollama to use persistent storage
-sudo systemctl stop ollama
-echo 'OLLAMA_HOST=0.0.0.0' | sudo tee /etc/ollama/env
-echo 'OLLAMA_MODELS_PATH=/data/ollama' | sudo tee -a /etc/ollama/env
-sudo systemctl start ollama
-
-# Install Open-WebUI
-sudo docker run -d \
-    --name open-webui \
-    --restart unless-stopped \
-    -v /data/open-webui:/root/.cache \
-    -p 3000:8080 \
-    -e OLLAMA_API_BASE_URL=http://host.docker.internal:11434/api \
-    --add-host host.docker.internal:host-gateway \
-    ghcr.io/open-webui/open-webui:main
-
-# Configure Nginx
-cat << EOF | sudo tee /etc/nginx/sites-available/ollama
-server {
-    listen 80;
-    server_name ${DOMAIN};
-    return 301 https://\$host\$request_uri;
+# Function to log messages
+echo_log() {
+    echo "$(date +'%Y-%m-%d %H:%M:%S') - $1"
 }
 
-server {
-    listen 443 ssl;
-    server_name ${DOMAIN};
+echo_log "Starting user data script..."
+echo_log "Custom Domain: $CUSTOM_DOMAIN :: Admin Email: $ADMIN_EMAIL"
 
-    ssl_certificate /etc/letsencrypt/live/${DOMAIN}/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/${DOMAIN}/privkey.pem;
+# The NVIDIA setup happens automatically via systemd service if GPU is present
 
-    location / {
-        proxy_pass http://localhost:3000;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection 'upgrade';
-        proxy_set_header Host \$host;
-        proxy_cache_bypass \$http_upgrade;
-        
-        auth_basic "Restricted Access";
-        auth_basic_user_file /etc/nginx/.htpasswd;
+# Set up instance storage for Docker if available
+if [ -b /dev/nvme1n1 ]; then
+    echo_log "Setting up instance store for Docker..."
+    sudo mkfs -t ext4 /dev/nvme1n1
+    sudo mkdir -p /mnt/instance-store
+    sudo mount /dev/nvme1n1 /mnt/instance-store
+    echo '/dev/nvme1n1 /mnt/instance-store ext4 defaults,nofail 0 2' | sudo tee -a /etc/fstab
+    
+    # Move Docker to instance store for better performance
+    if [ -d "/mnt/instance-store" ]; then
+        echo_log "Moving Docker to instance store..."
+        sudo mkdir -p /mnt/instance-store/docker
+        sudo tee /etc/docker/daemon.json > /dev/null <<EOF
+{
+    "data-root": "/mnt/instance-store/docker",
+    "storage-driver": "overlay2",
+    "max-concurrent-downloads": 50,
+    "max-concurrent-uploads": 50,
+    "runtimes": {
+        "nvidia": {
+            "path": "nvidia-container-runtime",
+            "runtimeArgs": []
+        }
     }
 }
 EOF
+        sudo systemctl restart docker
+    fi
+fi
 
+# Configure Nginx with the custom domain
+echo_log "Configuring Nginx for custom domain: $CUSTOM_DOMAIN"
+sudo cp /etc/nginx/sites-available/ollama-template /etc/nginx/sites-available/ollama
+sudo sed -i "s/DOMAIN_PLACEHOLDER/$CUSTOM_DOMAIN/g" /etc/nginx/sites-available/ollama
 sudo ln -sf /etc/nginx/sites-available/ollama /etc/nginx/sites-enabled/
 sudo rm -f /etc/nginx/sites-enabled/default
+sudo systemctl restart nginx
 
-# Set up authentication
-echo "admin:$(htpasswd -nbB admin '${PASSWORD}')" | sudo tee /etc/nginx/.htpasswd
+# Start the Docker containers
+echo_log "Starting Docker containers..."
+cd /data && sudo docker-compose up -d || { echo_log "Docker containers failed to start!"; exit 1; }
 
-# Get SSL certificate
-sudo certbot --nginx -d ${DOMAIN} --non-interactive --agree-tos -m ${EMAIL}
+# Obtain SSL certificate
+echo_log "Setting up Certbot..."
+if [[ -n "$CUSTOM_DOMAIN" ]]; then
+    sudo certbot --nginx -d $CUSTOM_DOMAIN --non-interactive --agree-tos -m $ADMIN_EMAIL
+else
+    echo_log "Skipping Certbot setup due to missing $CUSTOM_DOMAIN"
+fi
 
-# Set up auto-renewal
+# Enable automatic certificate renewal
+echo_log "Configuring auto-renewal for SSL certificates..."
 echo "0 0 * * * root certbot renew --quiet" | sudo tee -a /etc/crontab
 
-# Set up instance auto-shutdown
-cat << 'EOF' | sudo tee /usr/local/bin/check-activity.sh
-#!/bin/bash
-# Check CPU usage over last 15 minutes
-USAGE=$(top -bn2 | grep "Cpu(s)" | tail -1 | awk '{print $2}')
-if (( $(echo "$USAGE < 5.0" | bc -l) )); then
-    sudo poweroff
-fi
-EOF
-
-sudo chmod +x /usr/local/bin/check-activity.sh
-echo "*/15 * * * * root /usr/local/bin/check-activity.sh" | sudo tee -a /etc/crontab
-
-# Notify on startup
-aws sns publish \
-    --topic-arn "${SNS_TOPIC}" \
-    --subject "Ollama Instance Started" \
-    --message "Your Ollama instance has started and is ready at https://${DOMAIN}"
+echo_log "User data script execution completed successfully."
