@@ -1,337 +1,156 @@
-# Secure Ollama Instance on AWS with Spot Pricing
+# Secure Ollama Deployment on AWS with Auto-Shutdown
 
-This Terraform configuration deploys a secure, cost-effective Ollama instance with Open-WebUI on AWS using spot instances. Features include:
+This Terraform configuration deploys a secure, cost-effective Ollama instance with Open-WebUI on AWS using spot or on-demand instances.
 
-- 🔒 Secure HTTPS access with Let's Encrypt
-- 💰 Cost-effective spot instance usage
-- 🔑 Authentication-protected WebUI
-- 📊 Usage monitoring and alerts
-- 💾 Persistent storage for models and data
-- 🏠 SSH access restricted to home network
-- ⏰ Automatic shutdown after 15 minutes of inactivity
+## Key Features
+
+- 🔒 **Secure HTTPS access** with automatic Let's Encrypt certificate provisioning
+- 💰 **Cost optimization** with spot instances and auto-shutdown after inactivity
+- 🚀 **Simplified deployment** using AWS Deep Learning Base AMI with NVIDIA drivers pre-installed
+- 🔄 **Multi-AZ availability** with automatic retries for spot capacity
+- 💾 **Persistent storage** for models on EBS volume (survives instance restarts)
+- 🕸️ **User-friendly interface** with Open-WebUI for Ollama
+- 🔑 **Authentication protection** for the WebUI
+- 📊 **Usage monitoring** and alerts
+- ⏰ **Auto-startup link** for easy instance resumption
+
+## Architecture
+
+This solution deploys:
+
+- **GPU Instance**: AWS G5.xlarge instance (NVIDIA A10G GPU) using the AWS Deep Learning Base AMI
+- **Persistent Storage**: 256GB EBS volume for model storage
+- **Docker Containers**: Ollama, Open-WebUI, Nginx, and Certbot
+- **Networking**: Elastic IP, DNS record in Route 53, and security groups
+- **Automation**: Auto-shutdown after 15 minutes of inactivity to save costs
+- **API Gateway**: For remote instance startup without AWS console access
 
 ## Prerequisites
 
-### 1️⃣ Install Required Tools
+1. **AWS Account** with appropriate permissions
+2. **Domain in Route 53** for HTTPS setup
+3. **SSH Key Pair** for instance access
+4. **Terraform** installed locally
 
-#### On macOS
+## Quick Start
 
-```bash
-# Install Homebrew if not already installed
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-
-# Install required tools
-brew install awscli terraform
-```
-
-#### On Ubuntu/Debian
-
-```bash
-# Update package list
-sudo apt-get update
-
-# Install AWS CLI
-sudo apt-get install -y awscli
-
-# Install Terraform
-wget -O- https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
-echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
-sudo apt-get update
-sudo apt-get install -y terraform
-```
-
-#### On Windows
-
-1. Install AWS CLI:
-   - Download from [AWS CLI Install Guide](https://aws.amazon.com/cli/)
-   - Run the installer
-   - Verify installation: `aws --version`
-
-2. Install Terraform:
-   - Download from [Terraform Downloads](https://www.terraform.io/downloads)
-   - Extract to a directory
-   - Add to PATH environment variable
-   - Verify installation: `terraform --version`
-
-### 2️⃣ Verify Tool Installation
-
-Ensure all tools are properly installed:
-
-```bash
-# Check AWS CLI version
-aws --version
-
-# Check Terraform version
-terraform --version
-```
-
-Each command should return a version number. If you get "command not found" errors, check your installation and PATH settings.
-
-### 3️⃣ Setup Your AWS Account
-
-1. Create an AWS account if you don't have one
-2. Create an IAM user with programmatic access using one of these two methods:
-
-#### Option A: Using AWS Console
-
-1. Go to IAM → Users → Add User
-2. Create a new policy with the following JSON:
-
-   ```json
-   {
-       "Version": "2012-10-17",
-       "Statement": [
-           {
-               "Effect": "Allow",
-               "Action": [
-                   "ec2:*",
-                   "route53:*",
-                   "sns:*",
-                   "cloudwatch:*"
-               ],
-               "Resource": "*"
-           },
-           {
-               "Effect": "Allow",
-               "Action": [
-                   "iam:CreateRole",
-                   "iam:PutRolePolicy",
-                   "iam:CreateInstanceProfile",
-                   "iam:AddRoleToInstanceProfile",
-                   "iam:PassRole",
-                   "iam:ListRolePolicies",
-                   "iam:GetRole",
-                   "iam:GetRolePolicy",
-                   "iam:DeleteRole",
-                   "iam:DeleteRolePolicy",
-                   "iam:RemoveRoleFromInstanceProfile",
-                   "iam:DeleteInstanceProfile",
-                   "iam:GetInstanceProfile",
-                   "iam:ListInstanceProfilesForRole",
-                   "iam:ListAttachedRolePolicies",
-                   "iam:DetachRolePolicy"
-               ],
-               "Resource": [
-                   "arn:aws:iam::*:role/ollama-instance-role",
-                   "arn:aws:iam::*:instance-profile/ollama-instance-profile"
-               ]
-           }
-       ]
-   }
-   ```
-
-#### Option B: Using AWS CLI
-
-1. Save the above policy to a file named `ollama-policy.json`
-2. Create and attach the policy:
+1. **Clone this repository**:
 
    ```bash
-   # Create the policy
-   aws iam create-policy \
-       --policy-name OllamaDeploymentPolicy \
-       --policy-document file://ollama-policy.json
-
-   # Create the user
-   aws iam create-user --user-name ollama-deployer
-
-   # Attach the policy to the user
-   aws iam attach-user-policy \
-       --user-name ollama-deployer \
-       --policy-arn arn:aws:iam::YOUR_ACCOUNT_ID:policy/OllamaDeploymentPolicy
-
-   # Create access keys
-   aws iam create-access-key --user-name ollama-deployer
+   git clone https://github.com/yourusername/secure-ollama-aws.git
+   cd secure-ollama-aws
    ```
 
-3. Save the Access Key ID and Secret Access Key securely
+2. **Create a `terraform.tfvars` file**:
 
-#### Required IAM Permissions Explained
+   ```hcl
+   aws_region         = "us-east-1"
+   custom_domain      = "ollama.yourdomain.com"
+   admin_email        = "you@example.com"
+   ssh_key_name       = "your-aws-key-name"
+   ssh_private_key_path = "~/.ssh/your-private-key.pem"
+   home_network_cidr  = "YOUR.HOME.IP.ADDRESS/32"
+   webui_password     = "your-secure-password"
+   use_spot_instance  = true
+   aws_account_id     = "your-aws-account-id"
+   ```
 
-The policy provides the minimum required permissions:
-
-- `ec2:*` - Manage EC2 instances, security groups, and EBS volumes
-- `route53:*` - Manage DNS records
-- `sns:*` - Create and manage SNS topics for notifications
-- `cloudwatch:*` - Set up monitoring and auto-shutdown
-- Various `iam:*` permissions:
-  - Create and manage the instance role for SNS access
-  - Manage instance profiles
-  - List and modify role policies
-  - These are scoped specifically to the Ollama role and instance profile
-
-### 4️⃣ Configure AWS CLI
-
-```bash
-aws configure
-```
-
-Enter the following information:
-
-- AWS Access Key ID
-- AWS Secret Access Key
-- Default region (e.g., us-east-1)
-- Default output format (json)
-
-### 5️⃣ Request Spot Instance Quota Increase (Optional)
-
-If you plan to use spot instances (recommended for cost savings):
-
-1. Go to AWS Console → Service Quotas → EC2
-2. Search for "All G and VT Spot Instance Requests"
-3. Request a quota increase to at least 1 vCPU
-4. Wait for AWS approval (typically 1-2 business days)
-
-You can use on-demand instances while waiting for the spot instance quota increase by setting `use_spot_instance = false` in your `terraform.tfvars` file.
-
-### 6️⃣ Set Up Your Domain in Route 53
-
-1. Go to [AWS Route 53](https://console.aws.amazon.com/route53/)
-2. Click **Hosted Zones** → **Create Hosted Zone**
-3. Enter your domain name (e.g., `yourdomain.com`) and select **Public Hosted Zone**
-4. Note the **NS (Name Server) Records** AWS provides
-5. Go to your domain registrar (e.g., GoDaddy, Namecheap) and update the **Name Server (NS) Records** with the values from AWS Route 53
-6. Wait for DNS propagation (can take up to 48 hours, but usually much faster)
-
-## 🔧 Setup Instructions
-
-### 1️⃣ Configure AWS Secrets Manager
-
-Store your authentication password securely in **AWS Secrets Manager** before deploying:
-
-```bash
-aws secretsmanager create-secret --name my-auth-password --secret-string 'SuperSecurePassword123'
-```
-
-### 2️⃣ Update `terraform.tfvars` (or pass variables via CLI)
-
-Create a `terraform.tfvars` file with:
-
-```hcl
-custom_domain      = "yourdomain.com"
-admin_email        = "you@example.com"
-key_pair_name      = "your-aws-key"
-auth_password_secret = "my-auth-password"
-allowed_ssh_ip     = "YOUR.PUBLIC.IP/32"
-use_spot_instance  = false  # Set to true after spot instance quota increase
-```
-
-### 3️⃣ Initialize Terraform
-
-```bash
-terraform init
-```
-
-### 4️⃣ Run Terraform Apply
-
-```bash
-terraform apply -auto-approve
-```
-
-This will create:
-✅ **Spot or On-demand Instance (G5 xlarge)**  
-✅ **Elastic IP & Route 53 DNS Record**  
-✅ **Security Groups and IAM Roles**  
-✅ **Ollama & Open-WebUI Installation**  
-✅ **SSL Setup & Authentication**
-
-## ✅ Verification
-
-1. **Check Terraform Outputs**
+3. **Initialize Terraform**:
 
    ```bash
-   terraform output
+   terraform init
    ```
 
-   Ensure the public IP matches your Route 53 DNS entry.
-
-2. **Verify HTTPS & Open-WebUI**
-   - Open `https://yourdomain.com`
-   - Login with `admin` and your **configured password**
-
-3. **Check SSL Certificate**
+4. **Deploy the infrastructure**:
 
    ```bash
-   openssl s_client -connect yourdomain.com:443
+   terraform apply
    ```
 
-   Ensure it's valid and auto-renewal is enabled.
+5. **Access your Ollama instance**:
+   - Open `https://your-domain.com` in your browser
+   - Login with username `admin` and the password you specified
+   - Start using Ollama with the Open-WebUI interface
 
-4. **Check AWS Logs**
-   - Open **CloudTrail** → Check API Calls
-   - Open **CloudWatch Logs** → Check Instance Auto-Stopping
+## Cost Optimization Features
 
-## 🔄 Maintenance & Updates
+1. **Spot Instance Support**:
+   - Set `use_spot_instance = true` to use spot instances for up to 70% cost savings
+   - Automated multi-AZ fallback if spot capacity isn't available
 
-### 🔹 To Manually Stop the Instance
+2. **Auto-Shutdown**:
+   - Instance automatically shuts down after 15 minutes of inactivity
+   - Models remain stored on the persistent EBS volume
 
-```bash
-aws ec2 stop-instances --instance-ids INSTANCE_ID
-```
+3. **One-Click Startup**:
+   - Use the provided auto-start URL to restart your instance when needed
+   - No need to access the AWS console
 
-### 🔹 To Update Secrets Manager Password
+## Managing Models
 
-```bash
-aws secretsmanager update-secret --secret-id my-auth-password --secret-string 'NewSuperSecurePassword!'
-```
+Models are stored on the persistent EBS volume at `/data/ollama/models`, ensuring they survive instance stops/starts and even spot instance replacements.
 
-### 🔹 To Destroy the Infrastructure
+To manage models:
 
-```bash
-terraform destroy -auto-approve
-```
-
-## 🔒 Security Notes
-
-- **Rotate secrets regularly** using AWS Secrets Manager rotation
-- **Limit SSH access** only to your IP (`allowed_ssh_ip`)
-- **Monitor logs in CloudTrail** for unauthorized access
-- **Review security group rules** periodically
-
-## 🔄 Managing Models
-
-### Adding New Models
-
-1. SSH into your instance:
+1. Connect to your instance:
 
    ```bash
-   ssh ubuntu@yourdomain.com
+   ssh ubuntu@your-domain.com
    ```
 
-2. List available models:
+2. Pull a new model:
 
    ```bash
-   ollama list
+   docker exec -it ollama ollama pull llama2
    ```
 
-3. Pull a new model:
+3. List available models:
 
    ```bash
-   ollama pull mistral
+   docker exec -it ollama ollama list
    ```
 
-4. Remove a model:
+## FAQ
 
-   ```bash
-   ollama rm mistral
-   ```
+**Q: How do I start my stopped instance?**  
+A: Use the auto-start URL from the Terraform output or bookmark the page at `https://your-domain.com/ollama-starter.html`.
 
-### Model Storage
+**Q: Why does my instance shut down automatically?**  
+A: The instance shuts down after 15 minutes of inactivity to save costs. Your models are preserved on the persistent storage.
 
-Models are stored on the persistent EBS volume mounted at `/data/ollama`. This ensures:
+**Q: How do I change the Open-WebUI password?**  
+A: Update the `webui_password` variable and run `terraform apply` again.
 
-- Models survive instance restarts
-- Models persist through spot instance replacements
-- Storage can be expanded if needed
+**Q: Can I use a larger instance type for more powerful models?**  
+A: Yes, modify the `instance_type` in `main.tf` to use a more powerful GPU instance like `g5.2xlarge`.
 
-## 💰 Cost Management
+## Customization
 
-- Use spot instances when possible (`use_spot_instance = true`)
-- Instance auto-stops after 15 minutes of inactivity
-- Models persist on EBS, so you only pay for storage
-- Monitor CloudWatch alerts for usage exceeding 4 hours/day
+- **Auto-Shutdown Timeout**: Change the `INACTIVITY_TIMEOUT` in the `docker-compose.yml` file
+- **Different Models**: Pull any model supported by Ollama
+- **Instance Size**: Modify the instance type in `main.tf` for larger models
 
-## 🚀 Future Improvements
+## Security Considerations
 
-🔹 **Enhance with Multi-Factor Authentication (MFA)**  
-🔹 **Enable AWS GuardDuty for Threat Detection**  
-🔹 **Integrate with AWS Security Hub for automated compliance**
+- SSH access is restricted to your home network IP address
+- WebUI is protected with authentication
+- All traffic is encrypted with HTTPS
+- Automatic certificate renewal via Let's Encrypt
+- IAM roles follow least-privilege principle
+
+## Troubleshooting
+
+**Instance not starting?**
+
+- Check CloudWatch logs under `/var/log/user-data.log`
+- Verify the security groups allow HTTP/HTTPS traffic
+- Ensure your Route 53 DNS records are correct
+
+**Can't connect after instance starts?**
+
+- The startup process takes 1-2 minutes to complete
+- Check that DNS has propagated correctly
+
+## License
+
+This project is licensed under the MIT License - see the LICENSE file for details.

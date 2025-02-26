@@ -13,19 +13,23 @@ provider "aws" {
   region = var.aws_region
 }
 
-# Use specific AMI created by Packer
-data "aws_ami" "ollama" {
+data "aws_ami" "ollama_base" {
   most_recent = true
-  owners      = ["self"]
+  owners      = ["amazon"]
 
   filter {
     name   = "name"
-    values = ["ollama-gpu-base-*"]
+    values = ["Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 22.04) *"]
   }
 
   filter {
     name   = "state"
     values = ["available"]
+  }
+
+  filter {
+    name   = "architecture"
+    values = ["x86_64"]
   }
 }
 
@@ -62,14 +66,46 @@ data "aws_availability_zones" "available" {
   }
 }
 
+# Create a local file containing the HTML content for the external data source to use
+resource "local_file" "starting_html" {
+  content  = file("${path.module}/templates/starting.html")
+  filename = "${path.module}/.terraform/tmp/starting.html"
+}
+
+resource "local_file" "starter_html" {
+  content  = file("${path.module}/templates/ollama-starter.html")
+  filename = "${path.module}/.terraform/tmp/starter_html.html"
+}
+
+# Use external data source to gzip content
+data "external" "gzip_html" {
+  program = ["bash", "${path.module}/compress_html.sh"]
+
+  # The script needs to know the file paths
+  query = {
+    starting_path = local_file.starting_html.filename
+    starter_path  = local_file.starter_html.filename
+  }
+}
+
+locals {
+  # Read HTML templates
+  starting_html_content = file("${path.module}/templates/starting.html")
+  starter_html_content  = file("${path.module}/templates/ollama-starter.html")
+
+  # Get the compressed content from the external data source
+  starting_html_gzip = data.external.gzip_html.result.starting_gzip
+  starter_html_gzip  = data.external.gzip_html.result.starter_gzip
+}
+
 # Spot Instance
 resource "aws_spot_instance_request" "ollama" {
   count                          = var.use_spot_instance ? 1 : 0
-  ami                            = data.aws_ami.ollama.id
+  ami                            = data.aws_ami.ollama_base.id
   instance_type                  = "g5.xlarge"
   spot_type                      = "one-time"
   spot_price                     = "0.75"
-  wait_for_fulfillment           = false # Changed to false so we can handle fulfillment ourselves
+  wait_for_fulfillment           = false
   availability_zone              = aws_ebs_volume.ollama_data.availability_zone
   key_name                       = var.ssh_key_name
   vpc_security_group_ids         = [aws_security_group.ollama.id]
@@ -83,11 +119,13 @@ resource "aws_spot_instance_request" "ollama" {
   }
 
   user_data = templatefile("${path.module}/user_data.sh", {
-    custom_domain          = var.custom_domain
-    admin_email            = var.admin_email
-    webui_password         = var.webui_password
-    api_gateway_status_url = local.api_gateway_status_url
-    api_gateway_start_url  = local.api_gateway_start_url
+    CUSTOM_DOMAIN          = var.custom_domain
+    ADMIN_EMAIL            = var.admin_email
+    WEBUI_PASSWORD         = var.webui_password
+    API_GATEWAY_STATUS_URL = local.api_gateway_status_url
+    API_GATEWAY_START_URL  = local.api_gateway_start_url
+    STARTING_HTML_GZIP     = local.starting_html_gzip
+    STARTER_HTML_GZIP      = local.starter_html_gzip
   })
 
   root_block_device {
@@ -164,7 +202,7 @@ try_az() {
     --spot-price 0.75 \
     --availability-zone $az \
     --launch-specification "{
-      \"ImageId\": \"${data.aws_ami.ollama.id}\",
+      \"ImageId\": \"${data.aws_ami.ollama_base.id}\",
       \"InstanceType\": \"g5.xlarge\",
       \"Placement\": {\"AvailabilityZone\": \"$az\"},
       \"KeyName\": \"${var.ssh_key_name}\",
@@ -180,11 +218,13 @@ try_az() {
         }
       }],
       \"UserData\": \"${base64encode(templatefile("${path.module}/user_data.sh", {
-    custom_domain          = var.custom_domain
-    admin_email            = var.admin_email
-    webui_password         = var.webui_password
-    api_gateway_status_url = local.api_gateway_status_url
-    api_gateway_start_url  = local.api_gateway_start_url
+    CUSTOM_DOMAIN          = var.custom_domain
+    ADMIN_EMAIL            = var.admin_email
+    WEBUI_PASSWORD         = var.webui_password
+    API_GATEWAY_STATUS_URL = local.api_gateway_status_url
+    API_GATEWAY_START_URL  = local.api_gateway_start_url
+    STARTING_HTML_GZIP     = local.starting_html_gzip
+    STARTER_HTML_GZIP      = local.starter_html_gzip
 }))}\"
     }")
   
@@ -324,7 +364,7 @@ locals {
 
   # More defensive state handling - check if state field exists
   instance_state_raw = local.instance_state_exists ? jsondecode(file(local.instance_state_path)) : { instance_id = "", request_id = "", az = local.default_az }
-  
+
   # Check if state field exists, and add it if not
   instance_state = merge(
     local.instance_state_raw,
@@ -354,7 +394,7 @@ locals {
 # On-demand Instance
 resource "aws_instance" "ollama" {
   count                  = var.use_spot_instance ? 0 : 1
-  ami                    = data.aws_ami.ollama.id
+  ami                    = data.aws_ami.ollama_base.id
   instance_type          = "g5.xlarge"
   availability_zone      = aws_ebs_volume.ollama_data.availability_zone
   key_name               = var.ssh_key_name
@@ -362,11 +402,13 @@ resource "aws_instance" "ollama" {
   iam_instance_profile   = aws_iam_instance_profile.ollama_profile.name
 
   user_data = templatefile("${path.module}/user_data.sh", {
-    custom_domain          = var.custom_domain
-    admin_email            = var.admin_email
-    webui_password         = var.webui_password
-    api_gateway_status_url = local.api_gateway_status_url
-    api_gateway_start_url  = local.api_gateway_start_url
+    CUSTOM_DOMAIN          = var.custom_domain
+    ADMIN_EMAIL            = var.admin_email
+    WEBUI_PASSWORD         = var.webui_password
+    API_GATEWAY_STATUS_URL = local.api_gateway_status_url
+    API_GATEWAY_START_URL  = local.api_gateway_start_url
+    STARTING_HTML_GZIP     = local.starting_html_gzip
+    STARTER_HTML_GZIP      = local.starter_html_gzip
   })
 
   root_block_device {
@@ -1030,6 +1072,6 @@ output "instance_state" {
 }
 
 output "ami_id" {
-  value       = data.aws_ami.ollama.id
+  value       = data.aws_ami.ollama_base.id
   description = "The AMI ID being used"
 }
