@@ -1,3 +1,4 @@
+#ollama.pkr.hcl
 packer {
   required_plugins {
     amazon = {
@@ -26,7 +27,7 @@ variable "subnet_id" {
 
 source "amazon-ebs" "ollama" {
   ami_name      = "ollama-gpu-base-{{timestamp}}"
-  instance_type = "t3.medium"  # Smaller, cheaper instance for AMI creation
+  instance_type = "t3.2xlarge"
   region        = var.region
 
   source_ami_filter {
@@ -50,7 +51,7 @@ source "amazon-ebs" "ollama" {
   # Set a larger root volume
   launch_block_device_mappings {
     device_name = "/dev/sda1"
-    volume_size = 25
+    volume_size = 80
     volume_type = "gp3"
     delete_on_termination = true
   }
@@ -65,14 +66,26 @@ source "amazon-ebs" "ollama" {
 build {
   name    = "ollama-ami"
   sources = ["source.amazon-ebs.ollama"]
-
+  
   provisioner "shell" {
     inline = [
       "echo 'Waiting for cloud-init to complete...'",
       "cloud-init status --wait"
     ]
   }
-
+  
+  # Copy the necessary files to the instance
+  provisioner "file" {
+    source      = "ollama-setup.sh"
+    destination = "/home/ubuntu/ollama-setup.sh"
+  }
+  
+  provisioner "file" {
+    source      = "docker-compose.yml"
+    destination = "/home/ubuntu/docker-compose.yml"
+  }
+  
+  # Run the main setup script
   provisioner "shell" {
     script = "setup.sh"
   }

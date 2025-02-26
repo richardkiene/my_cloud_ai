@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
+set -ex
 
 # Enable logging
 exec > >(tee /home/ubuntu/packer-provisioning.log) 2>&1
@@ -26,99 +26,30 @@ echo "Installing dependencies..."
 sudo apt-get install -y \
     docker.io \
     docker-compose \
-    nginx \
-    certbot \
-    python3-certbot-nginx \
-    apache2-utils \
     nvme-cli \
     nvidia-container-toolkit \
     nvidia-driver-535 \
-    nvidia-utils-535
+    nvidia-utils-535 \
+    jq \
+    zip \
+    awscli
+
+# Add ubuntu user to docker group
+sudo usermod -aG docker ubuntu
+echo "Added ubuntu user to docker group"
+
+# Add ubuntu user to docker group
+sudo usermod -aG docker ubuntu
 
 # Ensure NVIDIA modules load at boot
 echo "nvidia" | sudo tee -a /etc/modules
 
-# Create the setup script
+# Copy the updated scripts to the system
 sudo mkdir -p /usr/local/bin
-sudo tee /usr/local/bin/ollama-setup.sh > /dev/null << 'EOF'
-#!/bin/bash
-set -e
-
-# Log all output
-exec > >(tee /var/log/ollama-setup.log) 2>&1
-
-echo "Starting Ollama setup at $(date)"
-
-# Ensure NVIDIA driver is loaded
-if ! lsmod | grep -q nvidia; then
-  echo "Loading NVIDIA kernel module..."
-  modprobe nvidia
-  
-  # Verify NVIDIA driver is working
-  if ! nvidia-smi > /dev/null 2>&1; then
-    echo "ERROR: NVIDIA drivers failed to load!"
-    exit 1
-  fi
-  echo "NVIDIA drivers loaded successfully."
-fi
-
-# Configure Nginx
-if [ -f "/etc/nginx/sites-available/ollama-template" ]; then
-  # Get the hostname or use a provided domain
-  DOMAIN=${1:-$(curl -s http://169.254.169.254/latest/meta-data/public-hostname)}
-  EMAIL=${2:-"admin@example.com"}
-  
-  echo "Configuring Nginx for domain: $DOMAIN"
-  
-  # Create configuration from template
-  cp /etc/nginx/sites-available/ollama-template /etc/nginx/sites-available/ollama
-  sed -i "s/DOMAIN_PLACEHOLDER/$DOMAIN/g" /etc/nginx/sites-available/ollama
-  
-  # Enable the site
-  ln -sf /etc/nginx/sites-available/ollama /etc/nginx/sites-enabled/
-  rm -f /etc/nginx/sites-enabled/default
-  
-  # Test and restart Nginx
-  nginx -t && systemctl restart nginx
-  echo "Nginx configured successfully."
-  
-  # Set up SSL certificate if domain is provided and not an EC2 hostname
-  if [[ ! "$DOMAIN" =~ "amazonaws.com" ]] && [[ ! "$DOMAIN" =~ "compute" ]]; then
-    echo "Setting up SSL certificate for $DOMAIN..."
-    certbot --nginx -d $DOMAIN --non-interactive --agree-tos -m $EMAIL
-    echo "SSL certificate installed successfully."
-    
-    # Auto renewal
-    echo "0 0 * * * root certbot renew --quiet" | tee -a /etc/crontab
-  else
-    echo "Using EC2 hostname, skipping SSL setup."
-  fi
-fi
-
-# Start the containers
-echo "Starting Docker containers..."
-cd /data && docker-compose down || true
-cd /data && docker-compose up -d
-
-# Verify containers are running
-if docker ps | grep -q "ollama"; then
-  echo "Ollama container is running."
-else
-  echo "ERROR: Ollama container failed to start!"
-fi
-
-if docker ps | grep -q "open-webui"; then
-  echo "Open-WebUI container is running."
-else
-  echo "ERROR: Open-WebUI container failed to start!"
-fi
-
-echo "Ollama setup completed at $(date)"
-EOF
-
+sudo cp /home/ubuntu/ollama-setup.sh /usr/local/bin/
 sudo chmod +x /usr/local/bin/ollama-setup.sh
 
-# Create systemd service
+# Create systemd service for Ollama setup
 sudo tee /etc/systemd/system/ollama-setup.service > /dev/null << 'EOF'
 [Unit]
 Description=Ollama Setup Service
@@ -134,28 +65,41 @@ RemainAfterExit=true
 WantedBy=multi-user.target
 EOF
 
-# Configure Nginx template
-sudo tee /etc/nginx/sites-available/ollama-template > /dev/null << 'EOF'
-server {
-    listen 80;
-    server_name DOMAIN_PLACEHOLDER;
-    
-    location / {
-        proxy_pass http://127.0.0.1:3000;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection 'upgrade';
-        proxy_set_header Host $host;
-        proxy_cache_bypass $http_upgrade;
-    }
-}
-EOF
+# Enable the service
+sudo systemctl daemon-reload
+sudo systemctl enable ollama-setup.service
 
-# Create docker-compose.yml with correct environment variable
-sudo mkdir -p /data
-sudo tee /data/docker-compose.yml > /dev/null << 'EOF'
+# Create docker-compose.yml in /home/ubuntu so it can be copied to the EBS volume later
+sudo mkdir -p /home/ubuntu/ollama
+sudo tee /home/ubuntu/ollama/docker-compose.yml > /dev/null << 'EOF'
+# This file will be copied to /data during setup
 version: '3'
+
 services:
+  nginx:
+    image: nginx:alpine
+    container_name: nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /data/nginx/conf:/etc/nginx/conf.d
+      - /data/certbot/conf:/etc/letsencrypt
+      - /data/certbot/www:/var/www/certbot
+    depends_on:
+      - open-webui
+    restart: unless-stopped
+    command: "/bin/sh -c 'while :; do sleep 6h & wait $${!}; nginx -s reload; done & nginx -g \"daemon off;\"'"
+
+  certbot:
+    image: certbot/certbot
+    container_name: certbot
+    volumes:
+      - /data/certbot/conf:/etc/letsencrypt
+      - /data/certbot/www:/var/www/certbot
+    restart: unless-stopped
+    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew; sleep 12h & wait $${!}; done;'"
+
   ollama:
     image: ollama/ollama:latest
     container_name: ollama
@@ -166,7 +110,7 @@ services:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     volumes:
-      - /data/ollama:/root/.ollama
+      - /data/ollama/models:/root/.ollama
     deploy:
       resources:
         reservations:
@@ -183,20 +127,26 @@ services:
       - "3000:8080"
     environment:
       - OLLAMA_BASE_URL=http://ollama:11434
+      - WEBUI_AUTH=true
+      - WEBUI_AUTH_USER=admin
+      - WEBUI_AUTH_PASSWORD=${WEBUI_PASSWORD}
     volumes:
       - /data/open-webui:/root/.cache
     depends_on:
       - ollama
     restart: unless-stopped
+
+  autoshutdown:
+    image: alpine:latest
+    container_name: autoshutdown
+    volumes:
+      - /data/scripts:/scripts
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - INACTIVITY_TIMEOUT=900  # 15 minutes in seconds
+    restart: unless-stopped
+    command: "/scripts/monitor-activity.sh"
 EOF
-
-# Create data directories
-sudo mkdir -p /data/ollama
-sudo mkdir -p /data/open-webui
-
-# Enable the service
-sudo systemctl daemon-reload
-sudo systemctl enable ollama-setup.service
 
 # Cleanup
 echo "Cleaning up..."
