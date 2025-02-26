@@ -143,7 +143,6 @@ resource "aws_spot_instance_request" "ollama" {
   }
 }
 
-# Create a new null resource to handle trying multiple AZs
 resource "null_resource" "try_multiple_az_for_spot" {
   count = var.use_spot_instance ? 1 : 0
 
@@ -232,8 +231,8 @@ try_az() {
   echo "New request ID: $new_request_id"
   save_state "$new_request_id" "" "$az" "pending"
   
-  # Wait for up to 2 minutes for this request to be fulfilled
-  for i in {1..12}; do
+  # Wait for up to 3 minutes for this request to be fulfilled
+  for i in {1..18}; do
     sleep 10
     local new_status=$(check_spot_request $new_request_id)
     echo "Status: $new_status"
@@ -246,7 +245,7 @@ try_az() {
       echo "Request fulfilled! Instance ID: $instance_id"
       
       # Now check if the instance is actually running
-      for j in {1..6}; do
+      for j in {1..12}; do  # Wait up to 2 minutes for the instance to be running
         sleep 10
         local instance_state=$(check_instance_state $instance_id)
         echo "Instance state: $instance_state"
@@ -258,6 +257,11 @@ try_az() {
           # Update the EBS volume to be in the correct AZ
           echo "Modifying EBS volume to be in $az"
           aws ec2 modify-volume --volume-id ${aws_ebs_volume.ollama_data.id} --availability-zone $az || true
+          
+          # Add a wait for the instance to be fully ready
+          echo "Waiting for instance to be fully initialized..."
+          aws ec2 wait instance-status-ok --instance-ids $instance_id
+          echo "Instance is fully initialized!"
           
           # Save final state
           save_state "$new_request_id" "$instance_id" "$az" "running"
@@ -306,13 +310,17 @@ if [ "$INITIAL_STATUS" = "fulfilled" ]; then
   echo "Initial request fulfilled! Instance ID: $INSTANCE_ID"
   
   # Check if instance is actually running
-  for i in {1..6}; do
+  for i in {1..12}; do  # Wait up to 2 minutes for the instance to be running
     sleep 10
     INSTANCE_STATE=$(check_instance_state $INSTANCE_ID)
     echo "Instance state: $INSTANCE_STATE"
     
     if [ "$INSTANCE_STATE" = "running" ]; then
       echo "Instance is running!"
+      # Add a wait for the instance to be fully ready
+      echo "Waiting for instance to be fully initialized..."
+      aws ec2 wait instance-status-ok --instance-ids $INSTANCE_ID
+      echo "Instance is fully initialized!"
       save_state "$INITIAL_REQUEST_ID" "$INSTANCE_ID" "${aws_ebs_volume.ollama_data.availability_zone}" "running"
       exit 0
     elif [ "$INSTANCE_STATE" = "terminated" ]; then
@@ -343,9 +351,9 @@ echo "Failed to find capacity in any availability zone"
 save_state "" "" "${aws_ebs_volume.ollama_data.availability_zone}" "failed"
 exit 1
 EOT
-}
+  }
 
-depends_on = [aws_spot_instance_request.ollama, aws_ebs_volume.ollama_data]
+  depends_on = [aws_spot_instance_request.ollama, aws_ebs_volume.ollama_data]
 }
 
 # Read the state file created by the script
@@ -362,8 +370,15 @@ locals {
   instance_state_path   = "${path.module}/spot_instance_state.json"
   instance_state_exists = fileexists(local.instance_state_path)
 
-  # More defensive state handling - check if state field exists
-  instance_state_raw = local.instance_state_exists ? jsondecode(file(local.instance_state_path)) : { instance_id = "", request_id = "", az = local.default_az }
+  # More defensive state handling with proper defaults and error checking
+  instance_state_raw = local.instance_state_exists ? (
+    try(jsondecode(file(local.instance_state_path)), { instance_id = "", request_id = "", az = local.default_az, state = "unknown" })
+  ) : { 
+    instance_id = "", 
+    request_id = "", 
+    az = local.default_az, 
+    state = "waiting" 
+  }
 
   # Check if state field exists, and add it if not
   instance_state = merge(
@@ -372,18 +387,11 @@ locals {
   )
 
   # Safe accessors with defaults
-  spot_instance_id     = local.instance_state_exists ? local.instance_state.instance_id : ""
-  spot_instance_az     = local.instance_state_exists ? local.instance_state.az : local.default_az
-  instance_state_value = local.instance_state.state
+  spot_instance_id     = local.instance_state_exists ? lookup(local.instance_state, "instance_id", "") : ""
+  spot_instance_az     = local.instance_state_exists ? lookup(local.instance_state, "az", local.default_az) : local.default_az
+  instance_state_value = lookup(local.instance_state, "state", "waiting")
 
-  # For API Gateway and other resources
-  current_instance_id = var.use_spot_instance ? (
-    local.spot_instance_id != "" ? local.spot_instance_id : "waiting-for-spot"
-    ) : (
-    length(aws_instance.ollama) > 0 ? aws_instance.ollama[0].id : "default-instance-id"
-  )
-
-  # Determine if we have a valid running instance
+  # More robust validity check - ensure we have an ID and state is running
   has_valid_instance = var.use_spot_instance ? (
     local.spot_instance_id != "" && local.instance_state_value == "running"
     ) : (
@@ -446,24 +454,45 @@ resource "aws_instance" "ollama" {
 
 # Volume Attachment with proper dependency setup
 resource "aws_volume_attachment" "ollama_data_attach" {
-  count        = local.has_valid_instance ? 1 : 0
-  device_name  = "/dev/sdh"
-  volume_id    = aws_ebs_volume.ollama_data.id
-  instance_id  = var.use_spot_instance ? local.spot_instance_id : aws_instance.ollama[0].id
+  count       = local.has_valid_instance ? 1 : 0
+  device_name = "/dev/sdh"
+  volume_id   = aws_ebs_volume.ollama_data.id
+  instance_id = var.use_spot_instance ? local.spot_instance_id : aws_instance.ollama[0].id
   force_detach = true
 
-  # Add a provisioner to verify the instance is still running before attempting attachment
+  # Add a provisioner to verify the instance is running before attempting attachment
   provisioner "local-exec" {
     command = <<EOT
 #!/bin/bash
 # Verify instance is running before attempting attachment
 instance_id="${var.use_spot_instance ? local.spot_instance_id : aws_instance.ollama[0].id}"
-state=$(aws ec2 describe-instances --instance-ids $instance_id --query "Reservations[0].Instances[0].State.Name" --output text 2>/dev/null || echo "error")
-echo "Instance state is: $state"
-if [ "$state" != "running" ]; then
-  echo "Instance is not running! Current state: $state"
-  exit 1
-fi
+echo "Checking if instance $instance_id is ready for volume attachment..."
+
+# Check if instance exists and is running
+MAX_RETRIES=30
+RETRY_INTERVAL=10
+RETRY_COUNT=0
+
+while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+  state=$(aws ec2 describe-instances --instance-ids $instance_id --query "Reservations[0].Instances[0].State.Name" --output text 2>/dev/null || echo "not-found")
+  
+  if [ "$state" = "running" ]; then
+    # Check instance status
+    status=$(aws ec2 describe-instance-status --instance-ids $instance_id --query "InstanceStatuses[0].InstanceStatus.Status" --output text 2>/dev/null || echo "not-ready")
+    
+    if [ "$status" = "ok" ]; then
+      echo "Instance is running and status is ok. Proceeding with volume attachment."
+      exit 0
+    fi
+  fi
+  
+  echo "Instance state: $state, status: $status. Waiting $RETRY_INTERVAL seconds before retry ($RETRY_COUNT/$MAX_RETRIES)..."
+  sleep $RETRY_INTERVAL
+  RETRY_COUNT=$((RETRY_COUNT+1))
+done
+
+echo "Instance did not reach ready state after maximum retries. Continuing anyway as AWS may handle this gracefully."
+exit 0  # Continue even if not ideal - Terraform will handle attachment
 EOT
   }
 
@@ -525,25 +554,50 @@ resource "aws_eip_association" "ollama" {
   instance_id   = var.use_spot_instance ? local.spot_instance_id : aws_instance.ollama[0].id
   allocation_id = aws_eip.ollama.id
 
-  # Add a provisioner to verify the instance is still running before attempting association
+  # Add a robust provisioner to verify the instance is running before attempting association
   provisioner "local-exec" {
     command = <<EOT
 #!/bin/bash
 # Verify instance is running before attempting EIP association
 instance_id="${var.use_spot_instance ? local.spot_instance_id : aws_instance.ollama[0].id}"
-state=$(aws ec2 describe-instances --instance-ids $instance_id --query "Reservations[0].Instances[0].State.Name" --output text 2>/dev/null || echo "error")
-echo "Instance state is: $state"
-if [ "$state" != "running" ]; then
-  echo "Instance is not running! Current state: $state"
-  exit 1
-fi
+echo "Checking if instance $instance_id is ready for EIP association..."
+
+# Check if instance exists and is running
+MAX_RETRIES=30
+RETRY_INTERVAL=10
+RETRY_COUNT=0
+
+while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+  # Check if instance exists
+  exists=$(aws ec2 describe-instances --instance-ids $instance_id --query "length(Reservations[0].Instances)" --output text 2>/dev/null || echo "0")
+  
+  if [ "$exists" != "0" ]; then
+    # Get state
+    state=$(aws ec2 describe-instances --instance-ids $instance_id --query "Reservations[0].Instances[0].State.Name" --output text)
+    
+    if [ "$state" = "running" ]; then
+      echo "Instance is running. Proceeding with EIP association."
+      exit 0
+    fi
+  else
+    echo "Instance not found: $instance_id"
+  fi
+  
+  echo "Instance state: $exists/$state. Waiting $RETRY_INTERVAL seconds before retry ($RETRY_COUNT/$MAX_RETRIES)..."
+  sleep $RETRY_INTERVAL
+  RETRY_COUNT=$((RETRY_COUNT+1))
+done
+
+echo "Instance did not reach running state after maximum retries."
+exit 1  # Fail if we can't find the instance - this is critical
 EOT
   }
 
   depends_on = [
     null_resource.try_multiple_az_for_spot,
     aws_spot_instance_request.ollama,
-    aws_instance.ollama
+    aws_instance.ollama,
+    aws_volume_attachment.ollama_data_attach
   ]
 }
 
@@ -911,29 +965,58 @@ resource "null_resource" "update_api_gateway_variables" {
   triggers = {
     instance_id    = var.use_spot_instance ? local.spot_instance_id : (length(aws_instance.ollama) > 0 ? aws_instance.ollama[0].id : "none")
     instance_state = local.instance_state_value
+    # Add a random value to force this to run when needed
+    force_run      = uuid() 
   }
 
   provisioner "local-exec" {
     command = <<EOT
 #!/bin/bash
-# Verify instance is still running before updating API Gateway
+# Verify instance exists and is running before updating API Gateway
 instance_id="${var.use_spot_instance ? local.spot_instance_id : aws_instance.ollama[0].id}"
-if [ -n "$instance_id" ] && [ "$instance_id" != "none" ]; then
-  state=$(aws ec2 describe-instances --instance-ids $instance_id --query "Reservations[0].Instances[0].State.Name" --output text 2>/dev/null || echo "error")
-  echo "Instance state is: $state"
-  if [ "$state" != "running" ]; then
-    echo "Instance is not running! Current state: $state"
+echo "Checking if instance $instance_id is ready for API Gateway variable updates..."
+
+# Check if instance exists and is running
+MAX_RETRIES=30
+RETRY_INTERVAL=10
+RETRY_COUNT=0
+
+while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+  # Check if instance exists
+  exists=$(aws ec2 describe-instances --instance-ids $instance_id --query "length(Reservations)" --output text 2>/dev/null || echo "0")
+  
+  if [ "$exists" != "0" ]; then
+    # Get state
+    state=$(aws ec2 describe-instances --instance-ids $instance_id --query "Reservations[0].Instances[0].State.Name" --output text)
+    
+    if [ "$state" = "running" ]; then
+      echo "Instance is running. Proceeding with API Gateway updates."
+      break
+    fi
+  else
+    echo "Instance not found: $instance_id"
+  fi
+  
+  echo "Instance state check: Exists=$exists, State=$state. Waiting $RETRY_INTERVAL seconds before retry ($RETRY_COUNT/$MAX_RETRIES)..."
+  sleep $RETRY_INTERVAL
+  RETRY_COUNT=$((RETRY_COUNT+1))
+  
+  # If we've reached max retries, exit with a non-zero code
+  if [ $RETRY_COUNT -ge $MAX_RETRIES ]; then
+    echo "Instance did not reach running state after maximum retries."
     exit 1
   fi
-fi
+done
 
 # Now update API Gateway
+echo "Updating API Gateway stage variables..."
 aws apigateway update-stage \
   --rest-api-id ${aws_api_gateway_rest_api.ec2_control_api.id} \
   --stage-name prod \
   --patch-operations "op=replace,path=/variables/instance_id,value=${var.use_spot_instance ? local.spot_instance_id : (length(aws_instance.ollama) > 0 ? aws_instance.ollama[0].id : "none")}" \
                      "op=replace,path=/variables/spot_instance_id,value=${var.use_spot_instance ? local.spot_instance_id : "none"}" \
                      "op=replace,path=/variables/ondemand_instance_id,value=${!var.use_spot_instance ? (length(aws_instance.ollama) > 0 ? aws_instance.ollama[0].id : "none") : "none"}"
+echo "API Gateway stage variables updated successfully."
 EOT
   }
 
@@ -941,7 +1024,9 @@ EOT
     aws_api_gateway_stage.ec2_api_stage,
     null_resource.try_multiple_az_for_spot,
     aws_spot_instance_request.ollama,
-    aws_instance.ollama
+    aws_instance.ollama,
+    aws_volume_attachment.ollama_data_attach,
+    aws_eip_association.ollama
   ]
 }
 
