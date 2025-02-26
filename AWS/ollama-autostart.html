@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Ollama Auto-Start</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            line-height: 1.6;
+        }
+        .container {
+            text-align: center;
+            padding: 20px;
+            margin: 20px 0;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+        }
+        p {
+            color: #666;
+            margin-bottom: 20px;
+        }
+        .button {
+            display: inline-block;
+            background-color: #4CAF50;
+            color: white;
+            padding: 10px 20px;
+            text-decoration: none;
+            border-radius: 4px;
+            font-weight: bold;
+        }
+        .button:hover {
+            background-color: #45a049;
+        }
+        .code {
+            background-color: #f5f5f5;
+            padding: 10px;
+            border-radius: 4px;
+            font-family: monospace;
+            margin: 10px 0;
+            overflow-x: auto;
+        }
+        .instructions {
+            text-align: left;
+            margin: 30px 0;
+        }
+        .instructions ol {
+            padding-left: 20px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Ollama Instance Auto-Start</h1>
+        <p>Click the button below to start your Ollama instance if it's currently stopped.</p>
+        <a href="API_GATEWAY_START_URL" class="button">Start Ollama Instance</a>
+    </div>
+    
+    <div class="instructions">
+        <h2>How to Use This Page</h2>
+        <ol>
+            <li>Bookmark this page for easy access.</li>
+            <li>If you find the Ollama interface (<code>https://yourdomain.com</code>) is not responding, open this bookmark.</li>
+            <li>Click the "Start Ollama Instance" button above.</li>
+            <li>You will be redirected to a status page showing the instance startup progress.</li>
+            <li>When the instance is fully running, you'll be automatically redirected to your Ollama WebUI.</li>
+        </ol>
+        
+        <h2>About Auto-Start Feature</h2>
+        <p>Your Ollama instance automatically shuts down after 15 minutes of inactivity to save costs. This page provides a convenient way to restart it when needed.</p>
+        
+        <h2>Useful Links</h2>
+        <p>Direct URLs for advanced usage:</p>
+        <div class="code">Start Instance: API_GATEWAY_START_URL</div>
+        <div class="code">Check Status: API_GATEWAY_STATUS_URL</div>
+    </div>
+</body>
+</html>
