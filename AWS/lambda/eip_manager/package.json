@@ -1,0 +1,9 @@
+{
+    "name": "ollama-eip-manager-lambda-function",
+    "version": "1.0.0",
+    "description": "EIP Manager Lambda function for Ollama deployment",
+    "main": "index.js",
+    "dependencies": {
+      "aws-sdk": "^2.1057.0"
+    }
+}

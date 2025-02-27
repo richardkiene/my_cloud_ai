@@ -1,0 +1,9 @@
+{
+    "name": "ollama-update-urls-lambda-function",
+    "version": "1.0.0",
+    "description": "Update URLs Lambda function for Ollama deployment",
+    "main": "index.js",
+    "dependencies": {
+      "aws-sdk": "^2.1057.0"
+    }
+}

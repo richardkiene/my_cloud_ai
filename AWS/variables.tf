@@ -1,37 +1,36 @@
-#variables.tf
 variable "aws_region" {
-  description = "AWS region"
+  description = "AWS region for all resources"
   type        = string
   default     = "us-east-1"
 }
 
 variable "custom_domain" {
-  description = "Your custom domain name"
+  description = "Custom domain for the Ollama instance (must be configured in Route 53)"
   type        = string
 }
 
 variable "admin_email" {
-  description = "Admin email for SSL certificates and notifications"
+  description = "Admin email for Let's Encrypt and notifications"
   type        = string
 }
 
 variable "ssh_key_name" {
-  description = "Name of SSH key pair to use"
+  description = "Name of the SSH key pair to use for instance access"
   type        = string
 }
 
 variable "ssh_private_key_path" {
-  description = "Path to the SSH private key file for provisioning"
+  description = "Path to the SSH private key file for initial provisioning"
   type        = string
 }
 
 variable "home_network_cidr" {
-  description = "Your home network CIDR for SSH access (e.g., 1.2.3.4/32)"
+  description = "Your home network CIDR for SSH access (e.g. 1.2.3.4/32)"
   type        = string
 }
 
 variable "webui_password" {
-  description = "Password for WebUI authentication"
+  description = "Password for WebUI authentication (username is 'admin')"
   type        = string
   sensitive   = true
 }
@@ -42,24 +41,57 @@ variable "use_spot_instance" {
   default     = true
 }
 
-variable "aws_account_id" {
-  description = "AWS Account ID"
+variable "spot_max_price" {
+  description = "Maximum price per hour for spot instances"
   type        = string
-  sensitive   = true
+  default     = "1.00"
 }
 
-variable "allowed_azs" {
-  description = "List of allowed availability zones for spot instances"
-  type        = list(string)
-  default     = ["us-east-1a", "us-east-1b", "us-east-1c", "us-east-1d", "us-east-1f"]
+variable "instance_type" {
+  description = "Instance type to use"
+  type        = string
+  default     = "g5.xlarge"
 }
 
-# Example values file (terraform.tfvars):
-# aws_region = "us-east-1"
-# custom_domain = "ollama.yourdomain.com"
-# admin_email = "you@example.com"
-# ssh_key_name = "your-key-name"
-# ssh_private_key_path = "~/.ssh/your-key.pem"
-# home_network_cidr = "1.2.3.4/32"
-# webui_password_secret = "ollama/webui-password"
-# use_spot_instance = true
+variable "root_volume_size" {
+  description = "Size of the root volume in GB"
+  type        = number
+  default     = 100
+}
+
+variable "model_volume_size" {
+  description = "Size of the EBS volume for model storage in GB"
+  type        = number
+  default     = 256
+}
+
+variable "inactivity_timeout" {
+  description = "Time in seconds before auto-shutdown due to inactivity"
+  type        = number
+  default     = 900  # 15 minutes
+}
+
+# Static resource names to avoid circular references
+variable "asg_name" {
+  description = "Name of the Auto Scaling Group"
+  type        = string
+  default     = "ollama-asg"
+}
+
+variable "lambda_role_name" {
+  description = "Name of the IAM role for Lambda functions"
+  type        = string
+  default     = "ollama-lambda-role"
+}
+
+variable "sns_topic_name" {
+  description = "Name of the SNS topic for alerts"
+  type        = string
+  default     = "ollama-alerts"
+}
+
+variable "api_gateway_name" {
+  description = "Name of the API Gateway"
+  type        = string
+  default     = "ollama-control-api"
+}

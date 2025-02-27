@@ -1,7 +1,0 @@
-[
-    {
-        "ID": "sir-az3q24vm",
-        "State": "cancelled",
-        "InstanceId": "i-085a9e4a1010a9475"
-    }
-]
