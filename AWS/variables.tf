@@ -49,8 +49,9 @@ variable "aws_account_id" {
 }
 
 variable "allowed_azs" {
-  type    = list(string)
-  default = ["us-east-1a", "us-east-1b", "us-east-1c", "us-east-1d", "us-east-1f"]
+  description = "List of allowed availability zones for spot instances"
+  type        = list(string)
+  default     = ["us-east-1a", "us-east-1b", "us-east-1c", "us-east-1d", "us-east-1f"]
 }
 
 # Example values file (terraform.tfvars):

@@ -44,13 +44,15 @@ locals {
 
 # EBS volume for persistent storage
 resource "aws_ebs_volume" "ollama_data" {
-  availability_zone = local.spot_instance_az
+  availability_zone = var.allowed_azs[0] # Start with first allowed AZ
   size              = 256
   type              = "gp3"
   encrypted         = true
 
+  # Important: Allow the AZ to be modified
   lifecycle {
     ignore_changes = [availability_zone]
+
   }
 
   tags = {
@@ -64,6 +66,10 @@ data "aws_availability_zones" "available" {
     name   = "region-name"
     values = [var.aws_region]
   }
+}
+
+data "external" "spot_instance" {
+  program = ["bash", "${path.module}/fetch_spot_instance.sh"]
 }
 
 # Create a local file containing the HTML content for the external data source to use
@@ -98,13 +104,62 @@ locals {
   starter_html_gzip  = data.external.gzip_html.result.starter_gzip
 }
 
+# Read the state file created by the script - with better error handling
+data "local_file" "spot_instance_state" {
+  count      = var.use_spot_instance && fileexists("${path.module}/spot_instance_state.json") ? 1 : 0
+  filename   = "${path.module}/spot_instance_state.json"
+  depends_on = [null_resource.try_multiple_az_for_spot]
+}
+
+locals {
+  # State tracking from the state file
+  instance_state_path   = "${path.module}/spot_instance_state.json"
+  instance_state_exists = fileexists(local.instance_state_path)
+
+  # Parse JSON with proper error handling
+  instance_state_raw = local.instance_state_exists ? (
+    jsondecode(file(local.instance_state_path))
+    ) : {
+    instance_id = "",
+    request_id  = "",
+    az          = var.allowed_azs[0],
+    state       = "unknown"
+  }
+
+  # Extract values with defaults
+  spot_instance_id     = lookup(local.instance_state_raw, "instance_id", "")
+  spot_instance_az     = lookup(local.instance_state_raw, "az", var.allowed_azs[0])
+  instance_state_value = lookup(local.instance_state_raw, "state", "unknown")
+
+  # Determine if we have a valid instance - with dependency on verification
+  has_valid_instance = var.use_spot_instance ? (
+    local.spot_instance_id != "" &&
+    local.instance_state_value == "running" &&
+    (length(null_resource.verify_instance_running) == 0 ||
+    length(null_resource.verify_instance_running) > 0)
+    ) : (
+    length(aws_instance.ollama) > 0
+  )
+}
+
+resource "null_resource" "try_multiple_az" {
+  provisioner "local-exec" {
+    command = "bash try_multiple_az.sh ${aws_spot_instance_request.ollama[0].id} ${aws_security_group.ollama.id} ${data.aws_ami.ollama_base.id} ${aws_ebs_volume.ollama_data.id} ${aws_spot_instance_request.ollama[0].instance_type} ${aws_iam_instance_profile.ollama_profile.id} ${var.ssh_key_name} ${base64encode(file("${path.module}/user_data.sh"))} ${aws_spot_instance_request.ollama[0].availability_zone} ${join(" ", data.aws_availability_zones.available.names)}"
+  }
+
+  triggers = {
+    instance_id = length(aws_spot_instance_request.ollama) > 0 ? aws_spot_instance_request.ollama[0].spot_instance_id : ""
+    volume_id   = aws_ebs_volume.ollama_data.id
+  }
+}
+
 # Spot Instance
 resource "aws_spot_instance_request" "ollama" {
-  count                          = var.use_spot_instance ? 1 : 0
+  count                          = data.external.spot_instance.result["instance_id"] != "" || !var.use_spot_instance ? 0 : 1
   ami                            = data.aws_ami.ollama_base.id
   instance_type                  = "g5.xlarge"
   spot_type                      = "one-time"
-  spot_price                     = "0.75"
+  spot_price                     = "0.85"
   wait_for_fulfillment           = false
   availability_zone              = aws_ebs_volume.ollama_data.availability_zone
   key_name                       = var.ssh_key_name
@@ -115,7 +170,8 @@ resource "aws_spot_instance_request" "ollama" {
 
   lifecycle {
     create_before_destroy = true
-    ignore_changes        = [spot_price, availability_zone]
+    #ignore_changes        = [spot_price, availability_zone] // TODO: Put this back
+    ignore_changes = [spot_price, availability_zone, user_data]
   }
 
   user_data = templatefile("${path.module}/user_data.sh", {
@@ -147,256 +203,92 @@ resource "null_resource" "try_multiple_az_for_spot" {
   count = var.use_spot_instance ? 1 : 0
 
   provisioner "local-exec" {
-    command = <<EOT
-#!/bin/bash
-# Script to try multiple availability zones for spot capacity
+    # Copy the update_spot_instance_state.sh script
+    command = "cat > ${path.module}/update_spot_instance_state.sh << 'EOF'\n${file("${path.module}/update_spot_instance_state.sh")}\nEOF\nchmod +x ${path.module}/update_spot_instance_state.sh"
+  }
 
-set -e  # Exit on error
+  provisioner "local-exec" {
+    # Copy the try_multiple_az.sh script
+    command = "cat > ${path.module}/try_multiple_az.sh << 'EOF'\n${file("${path.module}/try_multiple_az.sh")}\nEOF\nchmod +x ${path.module}/try_multiple_az.sh"
+  }
 
-# Function to check spot request status
-check_spot_request() {
-  local request_id=$1
-  local status=$(aws ec2 describe-spot-instance-requests \
-    --spot-instance-request-ids $request_id \
-    --query "SpotInstanceRequests[0].Status.Code" --output text 2>/dev/null || echo "error")
-  echo $status
-}
-
-# Function to check if an instance is running
-check_instance_state() {
-  local instance_id=$1
-  local state=$(aws ec2 describe-instances \
-    --instance-ids $instance_id \
-    --query "Reservations[0].Instances[0].State.Name" --output text 2>/dev/null || echo "unknown")
-  echo $state
-}
-
-# Function to cancel a spot request
-cancel_spot_request() {
-  local request_id=$1
-  aws ec2 cancel-spot-instance-requests --spot-instance-request-ids $request_id 2>/dev/null || true
-  echo "Cancelled spot request $request_id"
-}
-
-# Function to save state
-save_state() {
-  local request_id=$1
-  local instance_id=$2
-  local az=$3
-  local state=$4
-  
-  echo "{\"instance_id\": \"$instance_id\", \"request_id\": \"$request_id\", \"az\": \"$az\", \"state\": \"$state\"}" > ${path.module}/spot_instance_state.json
-  echo "Saved state: instance=$instance_id, request=$request_id, az=$az, state=$state"
-}
-
-# Function to try a specific AZ
-try_az() {
-  local az=$1
-  echo "Trying availability zone: $az"
-  
-  # Create new spot request in this AZ
-  local new_request=$(aws ec2 request-spot-instances \
-    --instance-count 1 \
-    --type one-time \
-    --spot-price 0.75 \
-    --availability-zone $az \
-    --launch-specification "{
-      \"ImageId\": \"${data.aws_ami.ollama_base.id}\",
-      \"InstanceType\": \"g5.xlarge\",
-      \"Placement\": {\"AvailabilityZone\": \"$az\"},
-      \"KeyName\": \"${var.ssh_key_name}\",
-      \"SecurityGroupIds\": [\"${aws_security_group.ollama.id}\"],
-      \"IamInstanceProfile\": {\"Name\": \"${aws_iam_instance_profile.ollama_profile.name}\"},
-      \"BlockDeviceMappings\": [{
-        \"DeviceName\": \"/dev/sda1\",
-        \"Ebs\": {
-          \"VolumeSize\": 100,
-          \"VolumeType\": \"gp3\",
-          \"DeleteOnTermination\": true,
-          \"Encrypted\": true
-        }
-      }],
-      \"UserData\": \"${base64encode(templatefile("${path.module}/user_data.sh", {
-    CUSTOM_DOMAIN          = var.custom_domain
-    ADMIN_EMAIL            = var.admin_email
-    WEBUI_PASSWORD         = var.webui_password
-    API_GATEWAY_STATUS_URL = local.api_gateway_status_url
-    API_GATEWAY_START_URL  = local.api_gateway_start_url
-    STARTING_HTML_GZIP     = local.starting_html_gzip
-    STARTER_HTML_GZIP      = local.starter_html_gzip
-}))}\"
-    }")
-  
-  local new_request_id=$(echo $new_request | jq -r '.SpotInstanceRequests[0].SpotInstanceRequestId')
-  echo "New request ID: $new_request_id"
-  save_state "$new_request_id" "" "$az" "pending"
-  
-  # Wait for up to 3 minutes for this request to be fulfilled
-  for i in {1..18}; do
-    sleep 10
-    local new_status=$(check_spot_request $new_request_id)
-    echo "Status: $new_status"
-    
-    if [ "$new_status" = "fulfilled" ]; then
-      # Success! Get the instance ID
-      local instance_id=$(aws ec2 describe-spot-instance-requests \
-        --spot-instance-request-ids $new_request_id \
-        --query "SpotInstanceRequests[0].InstanceId" --output text)
-      echo "Request fulfilled! Instance ID: $instance_id"
-      
-      # Now check if the instance is actually running
-      for j in {1..12}; do  # Wait up to 2 minutes for the instance to be running
-        sleep 10
-        local instance_state=$(check_instance_state $instance_id)
-        echo "Instance state: $instance_state"
-        
-        if [ "$instance_state" = "running" ]; then
-          # Success! Save state and continue
-          echo "Instance is running!"
-          
-          # Update the EBS volume to be in the correct AZ
-          echo "Modifying EBS volume to be in $az"
-          aws ec2 modify-volume --volume-id ${aws_ebs_volume.ollama_data.id} --availability-zone $az || true
-          
-          # Add a wait for the instance to be fully ready
-          echo "Waiting for instance to be fully initialized..."
-          aws ec2 wait instance-status-ok --instance-ids $instance_id
-          echo "Instance is fully initialized!"
-          
-          # Save final state
-          save_state "$new_request_id" "$instance_id" "$az" "running"
-          return 0
-        elif [ "$instance_state" = "terminated" ]; then
-          echo "Instance was terminated immediately. Likely capacity issue."
-          break
-        fi
-      done
-      
-      # If we get here, instance never reached running state
-      cancel_spot_request $new_request_id
-      return 1
-    fi
-    
-    if [ "$new_status" = "capacity-not-available" ] || [ "$new_status" = "error" ]; then
-      # Cancel this request and move on
-      cancel_spot_request $new_request_id
-      return 1
-    fi
-  done
-  
-  # If we got here, this AZ didn't work, cancel request
-  cancel_spot_request $new_request_id
-  return 1
-}
-
-# Initial spot request ID from Terraform
-INITIAL_REQUEST_ID="${aws_spot_instance_request.ollama[0].id}"
-echo "Initial spot request ID: $INITIAL_REQUEST_ID"
-save_state "$INITIAL_REQUEST_ID" "" "${aws_ebs_volume.ollama_data.availability_zone}" "pending"
-
-# Give the initial request some time
-sleep 30
-
-# Check initial request status
-INITIAL_STATUS=$(check_spot_request $INITIAL_REQUEST_ID)
-echo "Initial status: $INITIAL_STATUS"
-
-# If fulfilled, check if the instance is running
-if [ "$INITIAL_STATUS" = "fulfilled" ]; then
-  # Get the instance ID
-  INSTANCE_ID=$(aws ec2 describe-spot-instance-requests \
-    --spot-instance-request-ids $INITIAL_REQUEST_ID \
-    --query "SpotInstanceRequests[0].InstanceId" --output text)
-  echo "Initial request fulfilled! Instance ID: $INSTANCE_ID"
-  
-  # Check if instance is actually running
-  for i in {1..12}; do  # Wait up to 2 minutes for the instance to be running
-    sleep 10
-    INSTANCE_STATE=$(check_instance_state $INSTANCE_ID)
-    echo "Instance state: $INSTANCE_STATE"
-    
-    if [ "$INSTANCE_STATE" = "running" ]; then
-      echo "Instance is running!"
-      # Add a wait for the instance to be fully ready
-      echo "Waiting for instance to be fully initialized..."
-      aws ec2 wait instance-status-ok --instance-ids $INSTANCE_ID
-      echo "Instance is fully initialized!"
-      save_state "$INITIAL_REQUEST_ID" "$INSTANCE_ID" "${aws_ebs_volume.ollama_data.availability_zone}" "running"
-      exit 0
-    elif [ "$INSTANCE_STATE" = "terminated" ]; then
-      echo "Instance was terminated immediately. Likely capacity issue."
-      break
-    fi
-  done
-  
-  # If we get here, the instance never reached running state
-  cancel_spot_request $INITIAL_REQUEST_ID
-else
-  # Cancel the initial request
-  cancel_spot_request $INITIAL_REQUEST_ID
-fi
-
-# Try each AZ in order
-for AZ in ${join(" ", var.allowed_azs)}; do
-  echo "Trying next AZ: $AZ"
-  if try_az $AZ; then
-    echo "Success in $AZ"
-    exit 0
-  fi
-  echo "Failed in $AZ, trying next zone"
-done
-
-# If we get here, we couldn't get a spot instance in any AZ
-echo "Failed to find capacity in any availability zone"
-save_state "" "" "${aws_ebs_volume.ollama_data.availability_zone}" "failed"
-exit 1
-EOT
+  provisioner "local-exec" {
+    # Execute the script with all necessary parameters
+    command = "${path.module}/try_multiple_az.sh ${aws_spot_instance_request.ollama[0].id} ${aws_security_group.ollama.id} ${data.aws_ami.ollama_base.id} ${aws_ebs_volume.ollama_data.id} g5.xlarge ${aws_iam_instance_profile.ollama_profile.name} ${var.ssh_key_name} ${base64encode(templatefile("${path.module}/user_data.sh", {
+      CUSTOM_DOMAIN          = var.custom_domain
+      ADMIN_EMAIL            = var.admin_email
+      WEBUI_PASSWORD         = var.webui_password
+      API_GATEWAY_STATUS_URL = local.api_gateway_status_url
+      API_GATEWAY_START_URL  = local.api_gateway_start_url
+      STARTING_HTML_GZIP     = local.starting_html_gzip
+      STARTER_HTML_GZIP      = local.starter_html_gzip
+    }))} ${aws_ebs_volume.ollama_data.availability_zone} ${join(" ", var.allowed_azs)}"
   }
 
   depends_on = [aws_spot_instance_request.ollama, aws_ebs_volume.ollama_data]
 }
 
-# Read the state file created by the script
-data "local_file" "spot_instance_state" {
-  count      = var.use_spot_instance ? 1 : 0
-  filename   = "${path.module}/spot_instance_state.json"
+resource "null_resource" "ensure_spot_complete" {
+  count = var.use_spot_instance ? 1 : 0
+
+  # This will force Terraform to wait until the file exists
+  triggers = {
+    spot_complete = fileexists("${path.module}/.spot_provisioning_complete") ? timestamp() : uuid()
+  }
+
+  # Explicitly read the state file again to make sure we have the latest
+  provisioner "local-exec" {
+    command = "if [ -f ${path.module}/.spot_provisioning_complete ]; then cat ${path.module}/spot_instance_state.json; fi"
+  }
+
   depends_on = [null_resource.try_multiple_az_for_spot]
 }
 
-locals {
-  default_az = var.allowed_azs[0]
+resource "null_resource" "verify_instance_running" {
+  count = var.use_spot_instance && local.spot_instance_id != "" ? 1 : 0
 
-  # State tracking - these will be set by the script and read back
-  instance_state_path   = "${path.module}/spot_instance_state.json"
-  instance_state_exists = fileexists(local.instance_state_path)
-
-  # More defensive state handling with proper defaults and error checking
-  instance_state_raw = local.instance_state_exists ? (
-    try(jsondecode(file(local.instance_state_path)), { instance_id = "", request_id = "", az = local.default_az, state = "unknown" })
-  ) : { 
-    instance_id = "", 
-    request_id = "", 
-    az = local.default_az, 
-    state = "waiting" 
+  provisioner "local-exec" {
+    command = <<EOT
+#!/bin/bash
+instance_id="${local.spot_instance_id}"
+state=$(aws ec2 describe-instances --instance-ids $instance_id --query "Reservations[0].Instances[0].State.Name" --output text 2>/dev/null || echo "terminated")
+if [ "$state" != "running" ]; then
+  echo "Instance $instance_id is not running (state: $state). Removing stale state file."
+  rm -f ${path.module}/spot_instance_state.json
+  exit 1
+fi
+echo "Instance $instance_id confirmed running."
+EOT
   }
 
-  # Check if state field exists, and add it if not
-  instance_state = merge(
-    local.instance_state_raw,
-    { state = lookup(local.instance_state_raw, "state", "waiting") }
-  )
+  # Run this before other resources try to use the instance
+  triggers = {
+    instance_id = local.spot_instance_id
+  }
+}
 
-  # Safe accessors with defaults
-  spot_instance_id     = local.instance_state_exists ? lookup(local.instance_state, "instance_id", "") : ""
-  spot_instance_az     = local.instance_state_exists ? lookup(local.instance_state, "az", local.default_az) : local.default_az
-  instance_state_value = lookup(local.instance_state, "state", "waiting")
+resource "null_resource" "refresh_state_on_plan" {
+  provisioner "local-exec" {
+    command = <<EOT
+#!/bin/bash
+if [ -f "${path.module}/spot_instance_state.json" ]; then
+  instance_id=$(grep -o '"instance_id": "[^"]*' "${path.module}/spot_instance_state.json" | cut -d'"' -f4)
+  if [ -n "$instance_id" ]; then
+    state=$(aws ec2 describe-instances --instance-ids $instance_id --query "Reservations[0].Instances[0].State.Name" --output text 2>/dev/null || echo "terminated")
+    if [ "$state" != "running" ]; then
+      echo "WARNING: Instance $instance_id is no longer running. State: $state"
+      echo "Removing stale state file."
+      rm -f "${path.module}/spot_instance_state.json"
+    fi
+  fi
+fi
+EOT
+  }
 
-  # More robust validity check - ensure we have an ID and state is running
-  has_valid_instance = var.use_spot_instance ? (
-    local.spot_instance_id != "" && local.instance_state_value == "running"
-    ) : (
-    length(aws_instance.ollama) > 0
-  )
+  # Run this every time Terraform runs
+  triggers = {
+    always_run = timestamp()
+  }
 }
 
 # On-demand Instance
@@ -454,19 +346,18 @@ resource "aws_instance" "ollama" {
 
 # Volume Attachment with proper dependency setup
 resource "aws_volume_attachment" "ollama_data_attach" {
-  count       = local.has_valid_instance ? 1 : 0
-  device_name = "/dev/sdh"
-  volume_id   = aws_ebs_volume.ollama_data.id
-  instance_id = var.use_spot_instance ? local.spot_instance_id : aws_instance.ollama[0].id
+  count        = local.has_valid_instance ? 1 : 0
+  device_name  = "/dev/sdh"
+  volume_id    = aws_ebs_volume.ollama_data.id
+  instance_id  = var.use_spot_instance ? local.spot_instance_id : aws_instance.ollama[0].id
   force_detach = true
 
   # Add a provisioner to verify the instance is running before attempting attachment
   provisioner "local-exec" {
     command = <<EOT
 #!/bin/bash
-# Verify instance is running before attempting attachment
-instance_id="${var.use_spot_instance ? local.spot_instance_id : aws_instance.ollama[0].id}"
-echo "Checking if instance $instance_id is ready for volume attachment..."
+# Print the instance ID we're using for clarity
+echo "Attempting to attach volume to instance: ${var.use_spot_instance ? local.spot_instance_id : aws_instance.ollama[0].id}"
 
 # Check if instance exists and is running
 MAX_RETRIES=30
@@ -474,11 +365,11 @@ RETRY_INTERVAL=10
 RETRY_COUNT=0
 
 while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-  state=$(aws ec2 describe-instances --instance-ids $instance_id --query "Reservations[0].Instances[0].State.Name" --output text 2>/dev/null || echo "not-found")
+  state=$(aws ec2 describe-instances --instance-ids ${var.use_spot_instance ? local.spot_instance_id : aws_instance.ollama[0].id} --query "Reservations[0].Instances[0].State.Name" --output text 2>/dev/null || echo "not-found")
   
   if [ "$state" = "running" ]; then
     # Check instance status
-    status=$(aws ec2 describe-instance-status --instance-ids $instance_id --query "InstanceStatuses[0].InstanceStatus.Status" --output text 2>/dev/null || echo "not-ready")
+    status=$(aws ec2 describe-instance-status --instance-ids ${var.use_spot_instance ? local.spot_instance_id : aws_instance.ollama[0].id} --query "InstanceStatuses[0].InstanceStatus.Status" --output text 2>/dev/null || echo "not-ready")
     
     if [ "$status" = "ok" ]; then
       echo "Instance is running and status is ok. Proceeding with volume attachment."
@@ -497,6 +388,8 @@ EOT
   }
 
   depends_on = [
+    null_resource.verify_instance_running,
+    null_resource.ensure_spot_complete,
     null_resource.try_multiple_az_for_spot,
     aws_spot_instance_request.ollama,
     aws_instance.ollama
@@ -754,7 +647,11 @@ resource "aws_api_gateway_method_response" "start_method_response" {
 }
 
 resource "aws_api_gateway_integration_response" "start_integration_response" {
-  depends_on = [aws_api_gateway_integration.ec2_start_integration]
+  depends_on = [
+    aws_api_gateway_integration.ec2_start_integration,
+    aws_api_gateway_integration.status_options_integration,
+    aws_api_gateway_method_response.status_options_response
+  ]
 
   rest_api_id = aws_api_gateway_rest_api.ec2_control_api.id
   resource_id = aws_api_gateway_resource.start_resource.id
@@ -896,6 +793,11 @@ resource "aws_api_gateway_method_response" "status_options_response" {
 
 # CORS options integration response
 resource "aws_api_gateway_integration_response" "status_options_integration_response" {
+  depends_on = [
+    aws_api_gateway_integration.ec2_start_integration,
+    aws_api_gateway_integration.ec2_status_integration
+  ]
+
   rest_api_id = aws_api_gateway_rest_api.ec2_control_api.id
   resource_id = aws_api_gateway_resource.status_resource.id
   http_method = aws_api_gateway_method.status_options.http_method
@@ -936,6 +838,11 @@ resource "aws_api_gateway_deployment" "ec2_api_deployment" {
     ]))
   }
 
+  # Add a local-exec provisioner to wait a bit before creating the deployment
+  provisioner "local-exec" {
+    command = "sleep 30"
+  }
+
   lifecycle {
     create_before_destroy = true
   }
@@ -966,7 +873,7 @@ resource "null_resource" "update_api_gateway_variables" {
     instance_id    = var.use_spot_instance ? local.spot_instance_id : (length(aws_instance.ollama) > 0 ? aws_instance.ollama[0].id : "none")
     instance_state = local.instance_state_value
     # Add a random value to force this to run when needed
-    force_run      = uuid() 
+    force_run = uuid()
   }
 
   provisioner "local-exec" {
@@ -1159,4 +1066,8 @@ output "instance_state" {
 output "ami_id" {
   value       = data.aws_ami.ollama_base.id
   description = "The AMI ID being used"
+}
+
+output "debug_spot_instance_id" {
+  value = "State file exists: ${local.instance_state_exists}, Instance ID: ${local.spot_instance_id}, State: ${lookup(local.instance_state_raw, "state", "unknown")}"
 }

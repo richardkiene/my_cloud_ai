@@ -27,13 +27,29 @@ mount_data_volume() {
     return 0
   fi
   
-  # Find volume
-  for dev in /dev/sdh /dev/xvdh $(ls /dev/nvme*n1 2>/dev/null); do
-    if [ -e "$dev" ] && [ "$(lsblk -no MOUNTPOINT $dev)" == "" ]; then
+  # Find volume - improved detection for NVMe devices
+  # First, check traditional device names
+  for dev in /dev/sdh /dev/xvdh; do
+    if [ -e "$dev" ] && [ "$(lsblk -no MOUNTPOINT $dev 2>/dev/null)" == "" ]; then
       EBS_DEVICE="$dev"
       break
     fi
   done
+  
+  # If not found, check NVMe devices and look for the 256GB volume we expect
+  if [ -z "$EBS_DEVICE" ]; then
+    for dev in $(ls /dev/nvme*n1 2>/dev/null); do
+      # Check if device exists and isn't mounted
+      if [ -e "$dev" ] && [ "$(lsblk -no MOUNTPOINT $dev 2>/dev/null)" == "" ]; then
+        # Check size - we're looking for our 256GB volume
+        local SIZE=$(lsblk -no SIZE $dev | tr -d 'G')
+        if [[ "$SIZE" == "256" || "$SIZE" == "256.0" || "$SIZE" == "256G" ]]; then
+          EBS_DEVICE="$dev"
+          break
+        fi
+      fi
+    done
+  fi
   
   # Mount it
   if [ -z "$EBS_DEVICE" ]; then
@@ -43,8 +59,16 @@ mount_data_volume() {
   fi
   
   echo "EBS volume found at $EBS_DEVICE"
-  mkfs.ext4 -F $EBS_DEVICE
   mkdir -p /data
+  
+  # Check if the device has a filesystem already
+  if file -s $EBS_DEVICE | grep -q "data"; then
+    echo "Formatting new filesystem on $EBS_DEVICE"
+    mkfs.ext4 -F $EBS_DEVICE
+  else
+    echo "Filesystem already exists on $EBS_DEVICE"
+  fi
+  
   mount $EBS_DEVICE /data
   echo "$EBS_DEVICE /data ext4 defaults,nofail 0 2" >> /etc/fstab
   
